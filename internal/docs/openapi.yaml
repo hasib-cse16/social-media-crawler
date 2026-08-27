@@ -1,0 +1,479 @@
+openapi: 3.1.0
+
+info:
+  title: socialstats API
+  version: 1.0.0
+  summary: Public view counts for a social video URL.
+  description: |
+    Give the service a video URL and it returns that video's public metrics.
+
+    YouTube is implemented today. Meta (Facebook/Instagram) and TikTok URLs are
+    already routed to their providers and answer `501 not_implemented` until
+    their fetch is filled in, so clients can integrate against the final
+    contract now.
+
+    **Counters are omitted rather than zeroed.** When an uploader hides the like
+    or comment count, the field is absent from the response instead of being
+    reported as `0`.
+
+    **Caching.** The YouTube Data API charges quota per call, so successful
+    lookups are cached in-process. `X-Cache` and the `cached` body field tell you
+    which responses came from cache.
+  contact:
+    name: socialstats maintainers
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.example.com
+    description: Production (replace with your deployment)
+
+tags:
+  - name: stats
+    description: Video metric lookups.
+  - name: system
+    description: Liveness and readiness probes.
+
+paths:
+  /v1/stats:
+    get:
+      tags: [stats]
+      summary: Get stats for a video URL
+      description: |
+        Resolves the URL to a platform, fetches the video's public metrics and
+        returns them in a platform-agnostic shape.
+      operationId: getStats
+      parameters:
+        - name: url
+          in: query
+          required: true
+          description: |
+            The video URL. Any common form is accepted, with or without a
+            scheme: `watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`, `/live/`,
+            `/v/`, and `youtube-nocookie.com`.
+          schema:
+            type: string
+            format: uri
+            examples:
+              - https://www.youtube.com/watch?v=dQw4w9WgXcQ
+              - https://youtu.be/dQw4w9WgXcQ
+              - https://www.youtube.com/shorts/dQw4w9WgXcQ
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200': { $ref: '#/components/responses/Stats' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+    post:
+      tags: [stats]
+      summary: Get stats for a video URL (JSON body)
+      description: |
+        Identical to `GET /v1/stats`, for URLs that are awkward to pass in a
+        query string. Unknown body fields are rejected.
+      operationId: postStats
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatsRequest' }
+            examples:
+              youtube:
+                summary: A YouTube watch URL
+                value: { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }
+              short:
+                summary: A YouTube Shorts URL
+                value: { url: 'https://www.youtube.com/shorts/dQw4w9WgXcQ' }
+      responses:
+        '200': { $ref: '#/components/responses/Stats' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+        '503': { $ref: '#/components/responses/ProviderUnavailable' }
+        '504': { $ref: '#/components/responses/UpstreamTimeout' }
+
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      description: Reports process health and the platforms registered in this deployment.
+      operationId: getHealth
+      responses:
+        '200': { $ref: '#/components/responses/Health' }
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: Readiness probe
+      description: Same payload as `/healthz`; separate path so orchestrators can point probes independently.
+      operationId: getReady
+      responses:
+        '200': { $ref: '#/components/responses/Health' }
+
+components:
+  parameters:
+    RequestID:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Correlation id. When supplied it is echoed back and used in logs;
+        otherwise the service generates one.
+      schema:
+        type: string
+
+  headers:
+    XRequestID:
+      description: The request's correlation id, echoed on every response.
+      schema: { type: string }
+    XCache:
+      description: Whether this response was served from the in-process cache.
+      schema:
+        type: string
+        enum: [hit, miss]
+
+  schemas:
+    Platform:
+      type: string
+      description: A supported social video platform.
+      enum: [youtube, meta, tiktok]
+
+    StatsRequest:
+      type: object
+      additionalProperties: false
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: The video URL to look up.
+          examples: ['https://youtu.be/dQw4w9WgXcQ']
+
+    VideoStats:
+      type: object
+      description: |
+        Platform-agnostic public metrics for one video. Optional counters are
+        absent when the platform does not expose them or the uploader hides
+        them — never coerced to zero.
+      required: [platform, video_id, canonical_url, fetched_at, cached]
+      properties:
+        platform: { $ref: '#/components/schemas/Platform' }
+        video_id:
+          type: string
+          description: The platform's own id for the video.
+          examples: [dQw4w9WgXcQ]
+        canonical_url:
+          type: string
+          format: uri
+          description: The normalised URL for this video, whatever form was submitted.
+          examples: ['https://www.youtube.com/watch?v=dQw4w9WgXcQ']
+        title:
+          type: string
+          description: Video title. Omitted when the platform does not return one.
+        channel_id:
+          type: string
+          description: Id of the owning channel or account.
+        channel_title:
+          type: string
+          description: Display name of the owning channel or account.
+        published_at:
+          type: string
+          format: date-time
+          description: Publication timestamp, RFC 3339.
+        view_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Public view count.
+          examples: [1500000000]
+        like_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Public like count. Absent when hidden by the uploader.
+        comment_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Public comment count. Absent when comments are disabled or hidden.
+        fetched_at:
+          type: string
+          format: date-time
+          description: When these figures were retrieved from the platform.
+        cached:
+          type: boolean
+          description: True when served from the in-process cache rather than a fresh upstream call.
+
+    StatsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/VideoStats' }
+
+    Health:
+      type: object
+      required: [status, version, platforms]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          description: Build version, stamped at compile time.
+          examples: [1a2b3c4]
+        platforms:
+          type: array
+          description: Platforms registered in this deployment, in resolution order.
+          items: { $ref: '#/components/schemas/Platform' }
+
+    HealthEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/Health' }
+
+    ErrorCode:
+      type: string
+      description: |
+        Stable, machine-readable error identifier. Branch on this rather than on
+        the message, which may be reworded.
+
+        | code | http | meaning |
+        |------|------|---------|
+        | `missing_url` | 400 | the `url` parameter or field was absent |
+        | `invalid_url` | 400 | the URL could not be parsed as a supported video URL |
+        | `invalid_body` | 400 | the JSON body was unreadable or had unknown fields |
+        | `unsupported_platform` | 400 | no provider handles that host |
+        | `route_not_found` | 404 | no such endpoint |
+        | `not_found` | 404 | the video is missing, private, or removed |
+        | `rate_limited` | 429 | upstream quota exhausted — retry later |
+        | `internal_error` | 500 | unexpected server fault |
+        | `not_implemented` | 501 | the platform is recognised but not yet supported |
+        | `upstream_error` | 502 | the platform returned an error |
+        | `provider_unavailable` | 503 | that platform's credentials are not configured here |
+        | `upstream_timeout` | 504 | the platform did not respond in time |
+        | `client_closed_request` | 499 | the client disconnected mid-request |
+      enum:
+        - missing_url
+        - invalid_url
+        - invalid_body
+        - unsupported_platform
+        - route_not_found
+        - not_found
+        - rate_limited
+        - internal_error
+        - not_implemented
+        - upstream_error
+        - provider_unavailable
+        - upstream_timeout
+        - client_closed_request
+
+    Error:
+      type: object
+      description: The single error shape returned by every endpoint.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message:
+              type: string
+              description: Human-readable explanation. Do not parse.
+            request_id:
+              type: string
+              description: Correlation id for this request; quote it in bug reports.
+
+  responses:
+    Stats:
+      description: The video's metrics.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+        X-Cache: { $ref: '#/components/headers/XCache' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/StatsEnvelope' }
+          examples:
+            youtube:
+              summary: A YouTube video
+              value:
+                data:
+                  platform: youtube
+                  video_id: dQw4w9WgXcQ
+                  canonical_url: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+                  title: Never Gonna Give You Up
+                  channel_id: UCuAXFkgsw1L7xaCfnd5JJOw
+                  channel_title: Rick Astley
+                  published_at: '2009-10-25T06:57:33Z'
+                  view_count: 1500000000
+                  like_count: 18000000
+                  comment_count: 2200000
+                  fetched_at: '2026-08-27T10:00:00Z'
+                  cached: false
+            hiddenCounters:
+              summary: Uploader hides likes and comments — the fields are absent
+              value:
+                data:
+                  platform: youtube
+                  video_id: dQw4w9WgXcQ
+                  canonical_url: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+                  title: A quiet upload
+                  view_count: 1024
+                  fetched_at: '2026-08-27T10:00:00Z'
+                  cached: true
+
+    Health:
+      description: The service is up.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HealthEnvelope' }
+          examples:
+            ok:
+              value:
+                data:
+                  status: ok
+                  version: 1a2b3c4
+                  platforms: [youtube, meta, tiktok]
+
+    BadRequest:
+      description: The request was malformed, or the URL is not a supported video URL.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            missingURL:
+              summary: No url supplied
+              value:
+                error:
+                  code: missing_url
+                  message: query parameter 'url' is required
+                  request_id: 09f67ff774aefae24185e16d344b930b
+            invalidURL:
+              summary: Not a parseable video URL
+              value:
+                error:
+                  code: invalid_url
+                  message: the supplied url could not be parsed as a supported video url
+                  request_id: 09f67ff774aefae24185e16d344b930b
+            unsupportedPlatform:
+              summary: A host no provider claims
+              value:
+                error:
+                  code: unsupported_platform
+                  message: no provider handles that url
+                  request_id: add2d0a65dc565fa18585bb50d243bc3
+
+    NotFound:
+      description: The video, or the endpoint, does not exist.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            video:
+              value:
+                error:
+                  code: not_found
+                  message: the video does not exist, is private, or was removed
+                  request_id: 82386569467a5dad423f6d1f90278a05
+
+    RateLimited:
+      description: |
+        The upstream platform's quota is exhausted. The YouTube Data API reports
+        quota exhaustion as a 403, which this service normalises to 429 because
+        that is what it means operationally: back off and retry.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            quota:
+              value:
+                error:
+                  code: rate_limited
+                  message: upstream quota exhausted, retry later
+                  request_id: 38768f17bdb4f9e5f418d7852661fa3f
+
+    InternalError:
+      description: An unexpected server fault. Quote the request id when reporting it.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    NotImplemented:
+      description: |
+        The URL was recognised as belonging to a platform whose fetch is not
+        built yet (currently Meta and TikTok). The route and contract are final.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            tiktok:
+              value:
+                error:
+                  code: not_implemented
+                  message: this platform is not supported yet
+                  request_id: 38768f17bdb4f9e5f418d7852661fa3f
+
+    UpstreamError:
+      description: The platform's API returned an error this service could not classify further.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            upstream:
+              value:
+                error:
+                  code: upstream_error
+                  message: the upstream platform returned an error
+                  request_id: c1cbd7913f833ec7d25b8e5dcedb7b67
+
+    ProviderUnavailable:
+      description: |
+        A provider that handles this URL exists, but its credentials are not
+        configured on this deployment.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            noToken:
+              value:
+                error:
+                  code: provider_unavailable
+                  message: the provider for that url is not configured on this deployment
+                  request_id: 82386569467a5dad423f6d1f90278a05
+
+    UpstreamTimeout:
+      description: The platform did not respond within `UPSTREAM_TIMEOUT`.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
