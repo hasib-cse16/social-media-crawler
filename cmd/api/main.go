@@ -34,6 +34,14 @@ func main() {
 }
 
 func run() error {
+	// A .env in the working directory (or up to a few parents up, so running
+	// from an IDE works too) is loaded for local development. Real environment
+	// variables always take precedence, so this is inert in production.
+	envFile, err := config.LoadEnvFileFrom(".", config.DefaultEnvFile)
+	if err != nil {
+		return fmt.Errorf("load %s: %w", config.DefaultEnvFile, err)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -42,6 +50,9 @@ func run() error {
 	log := newLogger(cfg)
 	slog.SetDefault(log)
 	log.Info("starting", "version", version, "env", cfg.Env, "docs", cfg.DocsEnabled)
+	if envFile != "" {
+		log.Info("loaded env file", "path", envFile)
+	}
 
 	client := httpclient.New(cfg.UpstreamTimeout)
 
@@ -50,7 +61,11 @@ func run() error {
 	yt, err := youtube.New(cfg.YouTube, client, log)
 	if err != nil {
 		// YouTube is the primary platform: refuse to boot half-configured.
-		return fmt.Errorf("youtube provider: %w", err)
+		return fmt.Errorf("youtube provider: %w\n\n"+
+			"Set YOUTUBE_API_KEY in %s (copy .env.example), or export it in your\n"+
+			"run configuration. Get a key at console.cloud.google.com: enable\n"+
+			"\"YouTube Data API v3\", then Credentials -> Create credentials -> API key.",
+			err, config.DefaultEnvFile)
 	}
 	providers = append(providers, yt)
 

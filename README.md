@@ -10,9 +10,17 @@ Standard library only — no web framework, no ORM.
 
 ```bash
 cp .env.example .env          # then set YOUTUBE_API_KEY
-export $(grep -v '^#' .env | xargs)
 make run
 ```
+
+The service loads `.env` from the working directory (walking up a few parents,
+so running from an IDE works too). **Real environment variables always win**, so
+`.env` is inert in production, where you inject real env vars instead. There is
+no dotenv dependency — see `internal/config/dotenv.go`.
+
+Running from GoLand or another IDE needs no extra setup: just make sure the run
+configuration's working directory is inside the repository. Alternatively, set
+`YOUTUBE_API_KEY` in the run configuration's environment.
 
 ```bash
 curl "localhost:8080/v1/stats?url=https://youtu.be/dQw4w9WgXcQ"
