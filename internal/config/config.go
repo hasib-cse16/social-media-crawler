@@ -48,10 +48,39 @@ type MetaConfig struct {
 func (c MetaConfig) Enabled() bool { return c.AccessToken != "" }
 
 type TikTokConfig struct {
+	// BaseURL is the TikTok web origin. Public video pages are the only source
+	// of view counts for arbitrary URLs; see internal/provider/tiktok.
 	BaseURL string
+
+	// UserAgent is sent on page fetches. TikTok serves a block page to clients
+	// that do not look like a browser, so this must stay browser-like.
+	UserAgent string
+
+	// Enabled turns the provider off without removing it from the registry.
+	On bool
+
+	// MaxAttempts bounds how many times a page fetch is retried. TikTok serves
+	// an anti-bot challenge page to a substantial fraction of requests
+	// (measured at roughly a third), and a retry usually gets the real page,
+	// so more than one attempt is required for a usable success rate.
+	MaxAttempts int
+
+	// RetryBackoff is the base delay between attempts; it grows linearly.
+	// Keep it around a second: retrying every few hundred milliseconds trips
+	// TikTok's rate limiter, which then serves a hard block stub to everything.
+	RetryBackoff time.Duration
 }
 
-func (c TikTokConfig) Enabled() bool { return false } // not implemented yet
+func (c TikTokConfig) Enabled() bool { return c.On }
+
+// defaultTikTokUserAgent is a desktop Chrome UA. The exact string matters more
+// than it should: TikTok hard-blocks the canonical four-part version form
+// ("Chrome/124.0.0.0"), which is what most scraping libraries send, while the
+// three-part form ("Chrome/124.0") is served normally. Measured over repeated
+// requests, the four-part UA got a block stub every time and this one did not.
+// Override with TIKTOK_USER_AGENT if that changes.
+const defaultTikTokUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 // Load reads configuration from the environment, applying defaults.
 func Load() (*Config, error) {
@@ -75,7 +104,11 @@ func Load() (*Config, error) {
 			APIVersion:  str("META_API_VERSION", "v21.0"),
 		},
 		TikTok: TikTokConfig{
-			BaseURL: str("TIKTOK_API_BASE_URL", "https://open.tiktokapis.com"),
+			BaseURL:      str("TIKTOK_BASE_URL", "https://www.tiktok.com"),
+			UserAgent:    str("TIKTOK_USER_AGENT", defaultTikTokUserAgent),
+			On:           boolean("TIKTOK_ENABLED", true),
+			MaxAttempts:  intVal("TIKTOK_MAX_ATTEMPTS", 4),
+			RetryBackoff: dur("TIKTOK_RETRY_BACKOFF", time.Second),
 		},
 	}
 
@@ -100,6 +133,18 @@ func str(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func intVal(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func boolean(key string, def bool) bool {

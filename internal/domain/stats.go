@@ -25,6 +25,8 @@ type VideoStats struct {
 	ViewCount    *uint64    `json:"view_count,omitempty"`
 	LikeCount    *uint64    `json:"like_count,omitempty"`
 	CommentCount *uint64    `json:"comment_count,omitempty"`
+	ShareCount   *uint64    `json:"share_count,omitempty"`
+	SaveCount    *uint64    `json:"save_count,omitempty"`
 	FetchedAt    time.Time  `json:"fetched_at"`
 }
 

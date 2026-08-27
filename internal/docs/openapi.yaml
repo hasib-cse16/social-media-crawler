@@ -7,10 +7,15 @@ info:
   description: |
     Give the service a video URL and it returns that video's public metrics.
 
-    YouTube is implemented today. Meta (Facebook/Instagram) and TikTok URLs are
-    already routed to their providers and answer `501 not_implemented` until
-    their fetch is filled in, so clients can integrate against the final
-    contract now.
+    YouTube and TikTok are implemented. Meta (Facebook/Instagram) URLs are
+    already routed to their provider and answer `501 not_implemented` until its
+    fetch is filled in, so clients can integrate against the final contract now.
+
+    **Reliability differs by platform.** YouTube is read through the official
+    Data API and is reliable. TikTok has no API for arbitrary video URLs, so its
+    counters are read from the public video page; TikTok serves an anti-bot
+    challenge to a substantial share of requests, which the service retries.
+    Expect occasional `502 upstream_blocked` on TikTok URLs and retry.
 
     **Counters are omitted rather than zeroed.** When an uploader hides the like
     or comment count, the field is absent from the response instead of being
@@ -50,9 +55,14 @@ paths:
           in: query
           required: true
           description: |
-            The video URL. Any common form is accepted, with or without a
-            scheme: `watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`, `/live/`,
-            `/v/`, and `youtube-nocookie.com`.
+            The video URL. Any common form is accepted, with or without a scheme.
+
+            YouTube: `watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`, `/live/`,
+            `/v/`, `youtube-nocookie.com`.
+
+            TikTok: `/@user/video/<id>`, `/@user/photo/<id>`, `/v/<id>.html`,
+            and the `vm.tiktok.com` / `vt.tiktok.com` / `/t/<token>` short links
+            (resolved by following redirects).
           schema:
             type: string
             format: uri
@@ -60,6 +70,7 @@ paths:
               - https://www.youtube.com/watch?v=dQw4w9WgXcQ
               - https://youtu.be/dQw4w9WgXcQ
               - https://www.youtube.com/shorts/dQw4w9WgXcQ
+              - https://www.tiktok.com/@thebillionairebros/video/7249376077976472833
         - $ref: '#/components/parameters/RequestID'
       responses:
         '200': { $ref: '#/components/responses/Stats' }
@@ -181,7 +192,9 @@ components:
           examples: ['https://www.youtube.com/watch?v=dQw4w9WgXcQ']
         title:
           type: string
-          description: Video title. Omitted when the platform does not return one.
+          description: |
+            Video title. For TikTok this is the post caption, which can be long.
+            Omitted when the platform does not return one.
         channel_id:
           type: string
           description: Id of the owning channel or account.
@@ -208,6 +221,20 @@ components:
           format: int64
           minimum: 0
           description: Public comment count. Absent when comments are disabled or hidden.
+        share_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Public share count. TikTok reports this; YouTube does not expose it,
+            so it is absent for YouTube videos.
+        save_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Times the video was saved or added to favourites. TikTok reports
+            this; YouTube does not expose it.
         fetched_at:
           type: string
           format: date-time
@@ -262,6 +289,7 @@ components:
         | `internal_error` | 500 | unexpected server fault |
         | `not_implemented` | 501 | the platform is recognised but not yet supported |
         | `upstream_error` | 502 | the platform returned an error |
+        | `upstream_blocked` | 502 | the platform served an anti-bot challenge instead of content (TikTok); safe to retry |
         | `provider_unavailable` | 503 | that platform's credentials are not configured here |
         | `upstream_timeout` | 504 | the platform did not respond in time |
         | `client_closed_request` | 499 | the client disconnected mid-request |
@@ -276,6 +304,7 @@ components:
         - internal_error
         - not_implemented
         - upstream_error
+        - upstream_blocked
         - provider_unavailable
         - upstream_timeout
         - client_closed_request
@@ -322,6 +351,24 @@ components:
                   like_count: 18000000
                   comment_count: 2200000
                   fetched_at: '2026-08-27T10:00:00Z'
+                  cached: false
+            tiktok:
+              summary: A TikTok video, which also reports shares and saves
+              value:
+                data:
+                  platform: tiktok
+                  video_id: '7249376077976472833'
+                  canonical_url: https://www.tiktok.com/@thebillionairebros/video/7249376077976472833
+                  title: Jim Simmons, the founder of Renaissance Technologies...
+                  channel_id: '7205953225726624770'
+                  channel_title: TheBillionaireBros
+                  published_at: '2023-06-27T14:41:42Z'
+                  view_count: 220500
+                  like_count: 8702
+                  comment_count: 113
+                  share_count: 690
+                  save_count: 2732
+                  fetched_at: '2026-08-27T11:29:20Z'
                   cached: false
             hiddenCounters:
               summary: Uploader hides likes and comments — the fields are absent
@@ -439,7 +486,15 @@ components:
                   request_id: 38768f17bdb4f9e5f418d7852661fa3f
 
     UpstreamError:
-      description: The platform's API returned an error this service could not classify further.
+      description: |
+        The platform failed this request. Two codes share this status:
+
+        - `upstream_error` — the platform's API returned an error the service
+          could not classify further.
+        - `upstream_blocked` — the platform served an anti-bot challenge page
+          instead of content and the service exhausted its retries. Specific to
+          TikTok, whose counters come from the public page rather than an API;
+          retrying usually succeeds.
       headers:
         X-Request-Id: { $ref: '#/components/headers/XRequestID' }
       content:
@@ -447,11 +502,19 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
           examples:
             upstream:
+              summary: The platform's API errored
               value:
                 error:
                   code: upstream_error
                   message: the upstream platform returned an error
                   request_id: c1cbd7913f833ec7d25b8e5dcedb7b67
+            blocked:
+              summary: TikTok served an anti-bot challenge; retry
+              value:
+                error:
+                  code: upstream_blocked
+                  message: the platform served an anti-bot challenge instead of content; retry later
+                  request_id: 2b3d028dfea63146616e5ccc4d398546
 
     ProviderUnavailable:
       description: |

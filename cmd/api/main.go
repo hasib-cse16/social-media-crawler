@@ -72,7 +72,13 @@ func run() error {
 	// Meta and TikTok are registered unconditionally so their URLs get a clear
 	// 501/503 instead of "unsupported platform" while they are being built out.
 	providers = append(providers, meta.New(cfg.Meta, client, log))
-	providers = append(providers, tiktok.New(cfg.TikTok, client, log))
+
+	// TikTok gets its own client: it decides per-connection whether to serve a
+	// challenge page, so retries must not reuse a poisoned connection. The
+	// timeout here bounds a single attempt; the handler timeout below bounds the
+	// whole retry sequence.
+	tiktokClient := httpclient.NewWithoutConnectionReuse(cfg.UpstreamTimeout)
+	providers = append(providers, tiktok.New(cfg.TikTok, tiktokClient, log))
 
 	registry := provider.NewRegistry(providers...)
 	cache := stats.NewCache(cacheTTL())
@@ -87,7 +93,7 @@ func run() error {
 		api.NewHandler(service, log, version),
 		log,
 		api.RouterConfig{
-			HandlerTimeout: cfg.UpstreamTimeout + 2*time.Second,
+			HandlerTimeout: handlerTimeout(cfg),
 			DocsEnabled:    cfg.DocsEnabled,
 		},
 	)
@@ -104,6 +110,21 @@ func run() error {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
+}
+
+// handlerTimeout must cover the slowest provider. TikTok retries page fetches,
+// so its worst case is attempts x upstream timeout plus the backoff between them.
+func handlerTimeout(cfg *config.Config) time.Duration {
+	slowest := cfg.UpstreamTimeout
+
+	if cfg.TikTok.Enabled() {
+		attempts := time.Duration(max(cfg.TikTok.MaxAttempts, 1))
+		backoff := cfg.TikTok.RetryBackoff * attempts * (attempts + 1) / 2 // linear growth
+		if total := cfg.UpstreamTimeout*attempts + backoff; total > slowest {
+			slowest = total
+		}
+	}
+	return slowest + 2*time.Second
 }
 
 func cacheTTL() time.Duration {

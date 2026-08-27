@@ -29,6 +29,8 @@ func httpErrorFor(err error) (status int, code string, message string) {
 		return http.StatusGatewayTimeout, "upstream_timeout", "the upstream platform did not respond in time"
 	case errors.Is(err, context.Canceled):
 		return 499, "client_closed_request", "the client closed the request"
+	case errors.Is(err, domain.ErrBlocked):
+		return http.StatusBadGateway, "upstream_blocked", "the platform served an anti-bot challenge instead of content; retry later"
 	case errors.Is(err, domain.ErrUpstreamFailure):
 		return http.StatusBadGateway, "upstream_error", "the upstream platform returned an error"
 	default:

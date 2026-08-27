@@ -14,6 +14,11 @@ var (
 	ErrUpstreamFailure = errors.New("upstream request failed")
 	ErrNotImplemented  = errors.New("provider not implemented yet")
 	ErrMisconfigured   = errors.New("provider is not configured")
+
+	// ErrBlocked means the platform served an anti-bot challenge or block page
+	// rather than content. It is distinct from ErrUpstreamFailure because the
+	// remedy differs: back off, rotate egress, or revisit the fetch strategy.
+	ErrBlocked = errors.New("blocked by upstream anti-bot protection")
 )
 
 // UpstreamError carries the provider's own status/body for logging and
