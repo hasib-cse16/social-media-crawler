@@ -156,10 +156,33 @@ func TestDocsRoutes(t *testing.T) {
 	}
 }
 
+func TestSwaggerAliases(t *testing.T) {
+	router := newTestRouterWithConfig(okService(), RouterConfig{HandlerTimeout: time.Second, DocsEnabled: true})
+
+	// The well-known swaggo/gin-swagger path serves the UI directly.
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/swagger/index.html", nil))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "swagger-ui") {
+		t.Errorf("/swagger/index.html status = %d, body = %q", rr.Code, rr.Body.String())
+	}
+
+	// Bare /swagger and /swagger/ redirect to the canonical /docs.
+	for _, path := range []string{"/swagger", "/swagger/"} {
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusMovedPermanently {
+			t.Errorf("%s status = %d, want 301", path, rr.Code)
+		}
+		if loc := rr.Header().Get("Location"); loc != "/docs" {
+			t.Errorf("%s Location = %q, want /docs", path, loc)
+		}
+	}
+}
+
 func TestDocsDisabled(t *testing.T) {
 	router := newTestRouterWithConfig(okService(), RouterConfig{HandlerTimeout: time.Second, DocsEnabled: false})
 
-	for _, path := range []string{"/docs", "/openapi.yaml"} {
+	for _, path := range []string{"/docs", "/openapi.yaml", "/swagger/index.html", "/swagger"} {
 		rr := httptest.NewRecorder()
 		router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusNotFound {

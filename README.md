@@ -45,6 +45,7 @@ which is why responses are cached.
 | GET    | `/readyz`     | readiness                                 |
 | GET    | `/docs`       | Swagger UI                                |
 | GET    | `/openapi.yaml` | OpenAPI 3.1 specification               |
+| GET    | `/swagger/index.html` | alias for `/docs` (swaggo convention) |
 
 Success:
 
@@ -111,6 +112,8 @@ Two routes serve it, both behind `DOCS_ENABLED` (default `true`; set it to
 
 - `GET /docs` — Swagger UI, with "try it out" enabled.
 - `GET /openapi.yaml` — the raw document, for client generation and contract tests.
+- `GET /swagger/index.html` — the same UI at the location `gin-swagger`/`swaggo`
+  users expect; bare `/swagger` and `/swagger/` redirect to `/docs`.
 
 Swagger UI's CSS/JS come from the unpkg CDN. If your deployment cannot reach the
 public internet, vendor `swagger-ui-dist` into a `static/` directory, embed it,

@@ -29,10 +29,18 @@ func NewRouter(h *Handler, log *slog.Logger, cfg RouterConfig) http.Handler {
 	mux.HandleFunc("POST /v1/stats", h.PostStats)
 
 	if cfg.DocsEnabled {
+		ui := docs.UIHandler(docs.SpecPath)
+
 		mux.HandleFunc("GET "+docs.SpecPath, docs.SpecHandler())
-		mux.HandleFunc("GET /docs", docs.UIHandler(docs.SpecPath))
+		mux.HandleFunc("GET /docs", ui)
 		// Swagger UI links are commonly shared as /docs/.
 		mux.Handle("GET /docs/", http.RedirectHandler("/docs", http.StatusMovedPermanently))
+
+		// /swagger/index.html is the well-known location other Go stacks use
+		// (gin-swagger, swaggo). Honour it so habit and copied links both work.
+		mux.HandleFunc("GET /swagger/index.html", ui)
+		mux.Handle("GET /swagger", http.RedirectHandler("/docs", http.StatusMovedPermanently))
+		mux.Handle("GET /swagger/", http.RedirectHandler("/docs", http.StatusMovedPermanently))
 	}
 
 	mux.HandleFunc("/", h.NotFound)
