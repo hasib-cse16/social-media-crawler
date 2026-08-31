@@ -27,9 +27,40 @@ type Config struct {
 	// DocsEnabled serves the Swagger UI and OpenAPI spec from the binary.
 	DocsEnabled bool
 
+	Database DatabaseConfig
+
 	YouTube YouTubeConfig
 	Meta    MetaConfig
 	TikTok  TikTokConfig
+}
+
+// DatabaseConfig describes the PostgreSQL connection. The dashboard stores
+// users, tracked videos and the metric time series, so unlike the provider
+// credentials this is not optional: the service refuses to boot without it.
+type DatabaseConfig struct {
+	// URL is a libpq connection string or postgres:// URL.
+	URL string
+
+	// MaxConns bounds the pool. Postgres itself has a hard connection limit
+	// (100 by default) shared across every replica, so this is sized per
+	// replica with that budget in mind rather than set as high as it will go.
+	MaxConns int32
+
+	// MinConns keeps a few connections warm so the first request after an idle
+	// period does not pay for a TCP handshake, TLS and authentication.
+	MinConns int32
+
+	// MaxConnLifetime recycles connections periodically. It bounds how long a
+	// connection can hold stale session state, and it lets a rolling failover
+	// move traffic to the new primary without waiting for idle timeouts.
+	MaxConnLifetime time.Duration
+
+	// ConnectTimeout bounds a single connection attempt.
+	ConnectTimeout time.Duration
+
+	// MigrateOnBoot applies pending migrations at startup. Turn it off where
+	// migrations run as a separate deployment step.
+	MigrateOnBoot bool
 }
 
 type YouTubeConfig struct {
@@ -132,6 +163,14 @@ func Load() (*Config, error) {
 		UpstreamTimeout: dur("UPSTREAM_TIMEOUT", 8*time.Second),
 		LogLevel:        str("LOG_LEVEL", "info"),
 		DocsEnabled:     boolean("DOCS_ENABLED", true),
+		Database: DatabaseConfig{
+			URL:             str("DATABASE_URL", ""),
+			MaxConns:        int32Val("DATABASE_MAX_CONNS", 10),
+			MinConns:        int32Val("DATABASE_MIN_CONNS", 2),
+			MaxConnLifetime: dur("DATABASE_CONN_MAX_LIFETIME", 30*time.Minute),
+			ConnectTimeout:  dur("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
+			MigrateOnBoot:   boolean("MIGRATE_ON_BOOT", true),
+		},
 		YouTube: YouTubeConfig{
 			APIKey:  str("YOUTUBE_API_KEY", ""),
 			BaseURL: str("YOUTUBE_API_BASE_URL", "https://www.googleapis.com/youtube/v3"),
@@ -168,6 +207,20 @@ func (c *Config) validate() error {
 	if c.UpstreamTimeout <= 0 {
 		return fmt.Errorf("UPSTREAM_TIMEOUT must be positive")
 	}
+	if c.Database.URL == "" {
+		return fmt.Errorf("DATABASE_URL must be set\n\n" +
+			"The dashboard stores users, tracked videos and the metric history in\n" +
+			"PostgreSQL. For local development:\n" +
+			"  make db-up      # starts postgres in docker\n" +
+			"  make migrate    # applies the schema\n" +
+			"Then set DATABASE_URL in .env (copy .env.example)")
+	}
+	if c.Database.MaxConns < 1 {
+		return fmt.Errorf("DATABASE_MAX_CONNS must be at least 1")
+	}
+	if c.Database.MinConns < 0 || c.Database.MinConns > c.Database.MaxConns {
+		return fmt.Errorf("DATABASE_MIN_CONNS must be between 0 and DATABASE_MAX_CONNS (%d)", c.Database.MaxConns)
+	}
 	return nil
 }
 
@@ -188,6 +241,10 @@ func intVal(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func int32Val(key string, def int32) int32 {
+	return int32(intVal(key, int(def)))
 }
 
 func boolean(key string, def bool) bool {

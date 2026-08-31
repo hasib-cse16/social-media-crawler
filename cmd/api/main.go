@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,10 +22,17 @@ import (
 	"github.com/foodibd/socialstats/internal/provider/tiktok"
 	"github.com/foodibd/socialstats/internal/provider/youtube"
 	"github.com/foodibd/socialstats/internal/stats"
+	"github.com/foodibd/socialstats/internal/storage/postgres"
 )
 
 // version is stamped at build time: -ldflags "-X main.version=$(git rev-parse --short HEAD)".
 var version = "dev"
+
+// migrateOnly runs migrations and exits without serving. Deployments that apply
+// the schema as a separate step — an init container, a release job — run the
+// same binary with this flag, so migrations can never be applied by a build
+// different from the one about to serve traffic.
+var migrateOnly = flag.Bool("migrate-only", false, "apply pending migrations and exit")
 
 func main() {
 	if err := run(); err != nil {
@@ -34,6 +42,8 @@ func main() {
 }
 
 func run() error {
+	flag.Parse()
+
 	// A .env in the working directory (or up to a few parents up, so running
 	// from an IDE works too) is loaded for local development. Real environment
 	// variables always take precedence, so this is inert in production.
@@ -52,6 +62,47 @@ func run() error {
 	log.Info("starting", "version", version, "env", cfg.Env, "docs", cfg.DocsEnabled)
 	if envFile != "" {
 		log.Info("loaded env file", "path", envFile)
+	}
+
+	// The signal context is established before anything that can block, so a
+	// Ctrl-C during a slow database connect exits instead of hanging.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	db, err := postgres.Connect(ctx, cfg.Database, log)
+	if err != nil {
+		return fmt.Errorf("database: %w\n\n"+
+			"Set DATABASE_URL in %s (copy .env.example). For local development:\n"+
+			"  make db-up      # starts postgres in docker\n"+
+			"  make migrate    # applies the schema",
+			err, config.DefaultEnvFile)
+	}
+	defer db.Close()
+
+	if *migrateOnly {
+		if err := db.Migrate(ctx); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+		version, err := db.SchemaVersion(ctx)
+		if err != nil {
+			return fmt.Errorf("read schema version: %w", err)
+		}
+		log.Info("migrate-only complete", "schema_version", version)
+		return nil
+	}
+
+	if cfg.Database.MigrateOnBoot {
+		if err := db.Migrate(ctx); err != nil {
+			// A schema the code does not match is not something to serve
+			// traffic on top of.
+			return fmt.Errorf("migrate: %w", err)
+		}
+	} else {
+		version, err := db.SchemaVersion(ctx)
+		if err != nil {
+			return fmt.Errorf("read schema version: %w", err)
+		}
+		log.Info("migrations skipped", "reason", "MIGRATE_ON_BOOT=false", "schema_version", version)
 	}
 
 	client := httpclient.New(cfg.UpstreamTimeout)
@@ -88,13 +139,10 @@ func run() error {
 	cache := stats.NewCache(cacheTTL())
 	service := stats.NewService(registry, cache, log)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	go reapCache(ctx, cache, log)
 
 	handler := api.NewRouter(
-		api.NewHandler(service, log, version),
+		api.NewHandler(service, log, version, db),
 		log,
 		api.RouterConfig{
 			HandlerTimeout: handlerTimeout(cfg),

@@ -1,0 +1,54 @@
+# Local development dependencies. Production supplies its own DATABASE_URL.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: socialstats-postgres
+    environment:
+      POSTGRES_USER: socialstats
+      POSTGRES_PASSWORD: socialstats
+      POSTGRES_DB: socialstats
+      # The container image defaults to a locale-aware collation. Pinning C
+      # here keeps index ordering identical everywhere, so a query that uses an
+      # index locally does not fall back to a sort in production.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready alone reports true while the init scripts are still running,
+      # so the check queries instead: `make migrate` right after `make db-up`
+      # would otherwise race the first boot.
+      test: ["CMD-SHELL", "psql -U socialstats -d socialstats -c 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+
+  # The integration-test database. Separate from the development one so
+  # `make test-db` truncating tables cannot destroy what you were looking at.
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: socialstats-postgres-test
+    environment:
+      POSTGRES_USER: socialstats
+      POSTGRES_PASSWORD: socialstats
+      POSTGRES_DB: socialstats_test
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5433:5432"
+    # No volume: this database is disposable by design, and a fresh one every
+    # time is one fewer source of "works on my machine".
+    tmpfs:
+      - /var/lib/postgresql/data
+    command: >
+      postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U socialstats -d socialstats_test -c 'SELECT 1' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+
+volumes:
+  pgdata:

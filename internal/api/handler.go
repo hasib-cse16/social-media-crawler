@@ -24,15 +24,25 @@ type StatsService interface {
 	Platforms() []domain.Platform
 }
 
+// Prober reports whether a dependency this service cannot work without is
+// currently reachable. *postgres.DB satisfies it.
+type Prober interface {
+	Ping(ctx context.Context) error
+}
+
 // Handler holds the handler dependencies.
 type Handler struct {
 	svc     StatsService
 	log     *slog.Logger
 	version string
+
+	// db is probed by /readyz. It is an interface rather than a concrete type
+	// so this package never imports the storage layer.
+	db Prober
 }
 
-func NewHandler(svc StatsService, log *slog.Logger, version string) *Handler {
-	return &Handler{svc: svc, log: log, version: version}
+func NewHandler(svc StatsService, log *slog.Logger, version string, db Prober) *Handler {
+	return &Handler{svc: svc, log: log, version: version, db: db}
 }
 
 // statsResponse is the wire shape of a stats result.
@@ -101,12 +111,50 @@ func (h *Handler) respondStats(w http.ResponseWriter, r *http.Request, rawURL st
 	httpx.Data(w, r, http.StatusOK, statsResponse{VideoStats: result.Stats, Cached: result.Cached})
 }
 
-// Health handles GET /healthz.
+// Health handles GET /healthz: is this process alive?
+//
+// Liveness deliberately does not touch the database. A failing liveness probe
+// gets the container killed and restarted, and restarting the application does
+// not fix a database that is down — it just removes capacity from a fleet that
+// will recover on its own the moment the database comes back. Dependencies
+// belong in readiness, not liveness.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	httpx.Data(w, r, http.StatusOK, map[string]any{
 		"status":    "ok",
 		"version":   h.version,
 		"platforms": h.svc.Platforms(),
+	})
+}
+
+// Ready handles GET /readyz: can this process serve traffic?
+//
+// It returns 503 when the database is unreachable, which takes the instance out
+// of the load balancer without restarting it.
+func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
+	checks := map[string]string{}
+	ready := true
+
+	if h.db != nil {
+		if err := h.db.Ping(r.Context()); err != nil {
+			h.log.WarnContext(r.Context(), "readiness check failed", "dependency", "database", "error", err)
+			checks["database"] = "unreachable"
+			ready = false
+		} else {
+			checks["database"] = "ok"
+		}
+	}
+
+	status := http.StatusOK
+	state := "ready"
+	if !ready {
+		status = http.StatusServiceUnavailable
+		state = "not_ready"
+	}
+
+	httpx.Data(w, r, status, map[string]any{
+		"status":  state,
+		"version": h.version,
+		"checks":  checks,
 	})
 }
 

@@ -3,14 +3,23 @@
 An HTTP service that returns public view counts for a video URL. YouTube,
 TikTok and Meta (Facebook + Instagram) are implemented behind one interface.
 
-Standard library only — no web framework, no ORM.
+Two dependencies: `pgx` (there is no PostgreSQL driver in the standard
+library) and nothing else yet. No web framework, no ORM, no migration tool —
+queries are hand-written SQL in `internal/storage/postgres`.
 
 ## Quick start
 
 ```bash
 cp .env.example .env          # then set YOUTUBE_API_KEY
+make db-up                    # starts postgres in docker
+make migrate                  # applies the schema
 make run
 ```
+
+PostgreSQL is required: the dashboard stores users, tracked videos and the
+metric history there, and the service refuses to boot without a reachable
+`DATABASE_URL`. `make db-up` starts one on `:5432` for development and a
+disposable one on `:5433` for integration tests.
 
 The service loads `.env` from the working directory (walking up a few parents,
 so running from an IDE works too). **Real environment variables always win**, so
@@ -46,7 +55,7 @@ which is why responses are cached.
 | GET    | `/v1/stats`   | `?url=<video url>`                        |
 | POST   | `/v1/stats`   | body `{"url":"..."}`                      |
 | GET    | `/healthz`    | liveness + registered platforms           |
-| GET    | `/readyz`     | readiness                                 |
+| GET    | `/readyz`     | readiness — 503 when the database is unreachable |
 | GET    | `/docs`       | Swagger UI                                |
 | GET    | `/openapi.yaml` | OpenAPI 3.1 specification               |
 | GET    | `/swagger/index.html` | alias for `/docs` (swaggo convention) |
@@ -258,6 +267,7 @@ internal/
   api/                    HTTP transport: handlers, router, error mapping
   docs/                   embedded OpenAPI 3.1 spec + Swagger UI handlers
   httpx/                  server lifecycle, middleware, JSON envelopes
+  storage/postgres/       pool, forward-only migration runner, repositories
   provider/               registry that resolves a URL to its provider
     youtube/              YouTube Data API v3 + URL parsing
     meta/                 instagram embed + facebook page/graph extraction
@@ -286,6 +296,16 @@ provider_unavailable` rather than `unsupported_platform`, so a caller can tell
 
 ## Operations
 
+- **Liveness and readiness are different checks.** `/healthz` reports whether
+  the process is alive and deliberately does not touch the database; `/readyz`
+  pings it and returns `503` when it is unreachable. Restarting a process does
+  not repair a database, so putting the dependency in liveness would drain a
+  fleet that would otherwise recover on its own — readiness takes the instance
+  out of the load balancer and puts it back when the database returns.
+- **Migrations run at boot** behind an advisory lock, so a rolling deploy of
+  several replicas cannot race. `MIGRATE_ON_BOOT=false` plus
+  `socialstats -migrate-only` splits them into a separate step. They are
+  forward-only, and editing an applied migration is refused at startup.
 - Structured `slog` output: text in development, JSON elsewhere.
 - Graceful shutdown on SIGINT/SIGTERM, draining in-flight requests.
 - Timeouts at every layer: read/write/idle, per-handler, per-upstream-call.
@@ -297,11 +317,23 @@ provider_unavailable` rather than `unsupported_platform`, so a caller can tell
 ## Development
 
 ```bash
-make test     # go test -race ./...
+make test     # unit tests, no database needed
+make test-db  # integration tests against the :5433 database
 make lint     # fmt + vet + test
 make build    # ./bin/socialstats
 make docker
+
+make db-up    # start postgres (dev :5432, disposable test db :5433)
+make migrate  # apply pending migrations
+make db-reset # destroy the dev database and rebuild from migrations
+make db-shell # psql against the dev database
 ```
+
+Repository tests run against a real PostgreSQL rather than a mock, because
+most of what the storage layer relies on — advisory locks, transactional DDL,
+SQLSTATE codes, `SKIP LOCKED` — is behaviour a mock would only assert back at
+us. They skip themselves when `TEST_DATABASE_URL` is unset, so `make test`
+stays fast and dependency-free.
 
 ## Not included (deliberate next steps)
 

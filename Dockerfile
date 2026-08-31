@@ -2,7 +2,9 @@
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 
-COPY go.mod ./
+# go.sum is copied alongside go.mod so `go mod download` verifies against the
+# committed checksums rather than resolving whatever the proxy serves today.
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .

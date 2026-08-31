@@ -24,7 +24,7 @@ func NewRouter(h *Handler, log *slog.Logger, cfg RouterConfig) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", h.Health)
-	mux.HandleFunc("GET /readyz", h.Health)
+	mux.HandleFunc("GET /readyz", h.Ready)
 	mux.HandleFunc("GET /v1/stats", h.GetStats)
 	mux.HandleFunc("POST /v1/stats", h.PostStats)
 

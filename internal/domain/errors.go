@@ -15,6 +15,14 @@ var (
 	ErrNotImplemented  = errors.New("provider not implemented yet")
 	ErrMisconfigured   = errors.New("provider is not configured")
 
+	// Storage-layer sentinels. They are deliberately generic: the persistence
+	// layer does not know whether the row it could not find was a user, a
+	// video or a session, and callers that need a specific message wrap these
+	// rather than inventing their own.
+	ErrRecordNotFound = errors.New("record not found")
+	ErrConflict       = errors.New("record already exists")
+	ErrStorage        = errors.New("storage failure")
+
 	// ErrBlocked means the platform served an anti-bot challenge or block page
 	// rather than content. It is distinct from ErrUpstreamFailure because the
 	// remedy differs: back off, rotate egress, or revisit the fetch strategy.

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,13 +29,22 @@ func (f fakeService) Platforms() []domain.Platform {
 	return []domain.Platform{domain.PlatformYouTube}
 }
 
+// fakeProber stands in for the database in readiness checks.
+type fakeProber struct{ err error }
+
+func (f fakeProber) Ping(context.Context) error { return f.err }
+
 func newTestRouter(svc StatsService) http.Handler {
 	return newTestRouterWithConfig(svc, RouterConfig{HandlerTimeout: time.Second})
 }
 
 func newTestRouterWithConfig(svc StatsService, cfg RouterConfig) http.Handler {
+	return newTestRouterWithProber(svc, cfg, fakeProber{})
+}
+
+func newTestRouterWithProber(svc StatsService, cfg RouterConfig, db Prober) http.Handler {
 	log := slog.New(slog.DiscardHandler)
-	return NewRouter(NewHandler(svc, log, "test"), log, cfg)
+	return NewRouter(NewHandler(svc, log, "test", db), log, cfg)
 }
 
 func okService() fakeService {
@@ -134,6 +144,43 @@ func TestHealthAndUnknownRoute(t *testing.T) {
 	router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("unknown route status = %d", rr.Code)
+	}
+}
+
+func TestReadyzReflectsDatabaseHealth(t *testing.T) {
+	cfg := RouterConfig{HandlerTimeout: time.Second}
+
+	rr := httptest.NewRecorder()
+	newTestRouterWithProber(okService(), cfg, fakeProber{}).
+		ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rr.Code != http.StatusOK {
+		t.Errorf("healthy database: status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"database":"ok"`) {
+		t.Errorf("healthy database: body = %s", rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	newTestRouterWithProber(okService(), cfg, fakeProber{err: errors.New("connection refused")}).
+		ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("unreachable database: status = %d, want 503", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"database":"unreachable"`) {
+		t.Errorf("unreachable database: body = %s", rr.Body.String())
+	}
+}
+
+// Liveness must not depend on the database: restarting the process does not
+// repair a database, it only removes capacity from a fleet that would recover.
+func TestHealthzIgnoresDatabase(t *testing.T) {
+	rr := httptest.NewRecorder()
+	newTestRouterWithProber(okService(), RouterConfig{HandlerTimeout: time.Second},
+		fakeProber{err: errors.New("connection refused")}).
+		ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("healthz status = %d with a dead database, want 200", rr.Code)
 	}
 }
 

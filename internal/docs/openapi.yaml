@@ -133,7 +133,13 @@ paths:
     get:
       tags: [system]
       summary: Liveness probe
-      description: Reports process health and the platforms registered in this deployment.
+      description: |
+        Reports process health and the platforms registered in this deployment.
+
+        Liveness deliberately does not check the database. A failing liveness
+        probe gets the container restarted, and restarting the application does
+        not repair a database — it only removes capacity from a fleet that
+        would recover on its own. Dependencies belong in readiness.
       operationId: getHealth
       responses:
         '200': { $ref: '#/components/responses/Health' }
@@ -142,10 +148,16 @@ paths:
     get:
       tags: [system]
       summary: Readiness probe
-      description: Same payload as `/healthz`; separate path so orchestrators can point probes independently.
+      description: |
+        Reports whether this instance can serve traffic, which means checking
+        every dependency it cannot work without. Currently that is PostgreSQL.
+
+        A `503` here should take the instance out of the load balancer without
+        restarting it; it recovers by itself once the dependency returns.
       operationId: getReady
       responses:
-        '200': { $ref: '#/components/responses/Health' }
+        '200': { $ref: '#/components/responses/Ready' }
+        '503': { $ref: '#/components/responses/NotReady' }
 
 components:
   parameters:
@@ -287,6 +299,33 @@ components:
       required: [data]
       properties:
         data: { $ref: '#/components/schemas/Health' }
+
+    Readiness:
+      type: object
+      required: [status, version, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        version:
+          type: string
+          description: Build identifier of the serving binary.
+        checks:
+          type: object
+          description: |
+            One entry per dependency, naming its state. Keys are added as
+            dependencies are, so clients should not assume a fixed set.
+          additionalProperties:
+            type: string
+            enum: [ok, unreachable]
+          examples:
+            - { database: ok }
+
+    ReadyEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/Readiness' }
 
     ErrorCode:
       type: string
@@ -431,6 +470,40 @@ components:
                   view_count: 1024
                   fetched_at: '2026-08-27T10:00:00Z'
                   cached: true
+
+    Ready:
+      description: Every dependency is reachable.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ReadyEnvelope' }
+          examples:
+            ready:
+              value:
+                data:
+                  status: ready
+                  version: 1a2b3c4
+                  checks:
+                    database: ok
+
+    NotReady:
+      description: |
+        A dependency is unreachable. The response body names which one, and the
+        instance keeps reporting `503` until it recovers.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ReadyEnvelope' }
+          examples:
+            databaseDown:
+              value:
+                data:
+                  status: not_ready
+                  version: 1a2b3c4
+                  checks:
+                    database: unreachable
 
     Health:
       description: The service is up.

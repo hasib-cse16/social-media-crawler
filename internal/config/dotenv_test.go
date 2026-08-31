@@ -110,7 +110,8 @@ func TestLoadEnvFileFromReportsNothingFound(t *testing.T) {
 
 func TestLoadAppliesEnvFileValues(t *testing.T) {
 	dir := t.TempDir()
-	writeEnv(t, dir, "HTTP_ADDR=:9999\nCACHE_TTL=30s\nDOCS_ENABLED=false\n")
+	writeEnv(t, dir, "HTTP_ADDR=:9999\nCACHE_TTL=30s\nDOCS_ENABLED=false\n"+
+		"DATABASE_URL=postgres://localhost/test\n")
 
 	for _, k := range []string{"HTTP_ADDR", "DOCS_ENABLED"} {
 		t.Setenv(k, "")
