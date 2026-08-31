@@ -25,7 +25,7 @@ func translate(err error) error {
 		return nil
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("%w: %v", domain.ErrRecordNotFound, err)
+		return fmt.Errorf("%w: %w", domain.ErrRecordNotFound, err)
 	}
 
 	var pgErr *pgconn.PgError
@@ -36,26 +36,32 @@ func translate(err error) error {
 		return err
 	}
 
+	// Every branch wraps the sentinel *and* the original with %w. Both have to
+	// survive: callers match on the sentinel for control flow, and code that
+	// needs the SQLSTATE — the writer's missing-partition retry, for one —
+	// reaches the *pgconn.PgError through errors.As. Formatting the original
+	// with %v instead would silently break the second kind of caller, and it is
+	// the kind whose failure looks like a data loss rather than an error.
 	switch pgErr.Code {
 	case "23505": // unique_violation
-		return fmt.Errorf("%w: constraint %s: %v", domain.ErrConflict, pgErr.ConstraintName, pgErr.Message)
+		return fmt.Errorf("%w: constraint %s: %w", domain.ErrConflict, pgErr.ConstraintName, err)
 	case "23503": // foreign_key_violation
 		// A dangling reference is a bug in our code, not a user's mistake, so
 		// it maps to a storage failure rather than a 4xx-shaped sentinel.
-		return fmt.Errorf("%w: foreign key %s: %v", domain.ErrStorage, pgErr.ConstraintName, pgErr.Message)
+		return fmt.Errorf("%w: foreign key %s: %w", domain.ErrStorage, pgErr.ConstraintName, err)
 	case "23514": // check_violation
-		return fmt.Errorf("%w: check %s: %v", domain.ErrStorage, pgErr.ConstraintName, pgErr.Message)
+		return fmt.Errorf("%w: check %s: %w", domain.ErrStorage, pgErr.ConstraintName, err)
 	case "23502": // not_null_violation
-		return fmt.Errorf("%w: column %s must not be null", domain.ErrStorage, pgErr.ColumnName)
+		return fmt.Errorf("%w: column %s must not be null: %w", domain.ErrStorage, pgErr.ColumnName, err)
 	case "40001", "40P01": // serialization_failure, deadlock_detected
 		// Both are retryable by definition: the transaction did not happen and
 		// running it again is expected to work. Callers that can retry check
 		// for this with IsRetryable.
-		return fmt.Errorf("%w: %s (retryable): %v", domain.ErrStorage, pgErr.Code, pgErr.Message)
+		return fmt.Errorf("%w: %s is retryable: %w", domain.ErrStorage, pgErr.Code, err)
 	case "57014": // query_canceled
-		return fmt.Errorf("%w: statement timeout: %v", domain.ErrStorage, pgErr.Message)
+		return fmt.Errorf("%w: statement timeout: %w", domain.ErrStorage, err)
 	default:
-		return fmt.Errorf("%w: %s: %v", domain.ErrStorage, pgErr.Code, pgErr.Message)
+		return fmt.Errorf("%w: %s: %w", domain.ErrStorage, pgErr.Code, err)
 	}
 }
 

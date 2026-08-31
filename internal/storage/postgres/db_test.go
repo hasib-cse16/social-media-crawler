@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/foodibd/socialstats/internal/config"
 	"github.com/foodibd/socialstats/internal/domain"
 )
@@ -295,5 +297,34 @@ func TestTranslatePassesThroughContextErrors(t *testing.T) {
 	}
 	if got := translate(nil); got != nil {
 		t.Errorf("translate(nil) = %v, want nil", got)
+	}
+}
+
+// translate must keep the underlying *pgconn.PgError reachable, not just the
+// domain sentinel. Code that needs the SQLSTATE goes looking for it — the
+// writer's missing-partition retry does — and losing it there looks like data
+// loss rather than an error.
+func TestTranslateKeepsTheUnderlyingPgError(t *testing.T) {
+	db, ctx := migrated(t)
+
+	if _, err := db.Pool.Exec(ctx, `CREATE TABLE u (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO u VALUES (1)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	_, raw := db.Pool.Exec(ctx, `INSERT INTO u VALUES (1)`)
+	err := translate(raw)
+
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Errorf("sentinel lost: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("the *pgconn.PgError is not reachable through the wrapped error: %v", err)
+	}
+	if pgErr.Code != "23505" {
+		t.Errorf("SQLSTATE = %s, want 23505", pgErr.Code)
 	}
 }

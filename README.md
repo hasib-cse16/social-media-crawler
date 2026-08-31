@@ -267,7 +267,8 @@ internal/
   api/                    HTTP transport: handlers, router, error mapping
   docs/                   embedded OpenAPI 3.1 spec + Swagger UI handlers
   httpx/                  server lifecycle, middleware, JSON envelopes
-  storage/postgres/       pool, forward-only migration runner, repositories
+  storage/postgres/       pool, migrations, repositories (users, sessions,
+                          videos, tracking, metrics)
   provider/               registry that resolves a URL to its provider
     youtube/              YouTube Data API v3 + URL parsing
     meta/                 instagram embed + facebook page/graph extraction
@@ -328,6 +329,11 @@ make migrate  # apply pending migrations
 make db-reset # destroy the dev database and rebuild from migrations
 make db-shell # psql against the dev database
 ```
+
+The schema and repository layer are in place (users, sessions, videos,
+tracked videos, the partitioned metric time series and the fetch audit trail).
+The HTTP surface for them lands with the auth and tracking steps; see
+`docs/dashboard-design.md` for the plan and the reasoning.
 
 Repository tests run against a real PostgreSQL rather than a mock, because
 most of what the storage layer relies on — advisory locks, transactional DDL,

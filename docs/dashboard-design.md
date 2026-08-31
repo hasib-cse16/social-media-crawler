@@ -1,6 +1,6 @@
 # Dashboard design: per-user video tracking on PostgreSQL
 
-**Status:** proposed, awaiting approval
+**Status:** approved; steps 1 and 2 implemented
 **Scope:** turn the stateless stats API into a multi-user dashboard that tracks
 view counts for YouTube, TikTok and Meta videos over time.
 
@@ -801,17 +801,17 @@ nor need cleanup.
 
 Each step ends with something that runs and is tested.
 
-| # | Step | Delivers |
-|---|------|----------|
-| 1 | pgx pool, config, migration runner, `docker-compose`, `/readyz` checks the DB | The app boots against Postgres |
-| 2 | Migrations 0001–0006 + repository layer + integration tests | Schema exists, is exercised |
-| 3 | `auth` package: argon2id, sessions, middleware, rate limit | Login works via curl |
-| 4 | Tracking service + JSON endpoints §8 | Full API, no UI |
-| 5 | Poller: claim loop, per-platform pacing, backoff, `fetch_attempts` | History accumulates |
-| 6 | Housekeeping: rollups, retention, partition creation | Bounded storage |
-| 7 | YouTube `BatchProvider` | 50× less quota |
-| 8 | `web` package: templates, SVG charts, pages | The dashboard |
-| 9 | OpenAPI spec for the new routes, README, `.env.example` | Docs match reality |
+| # | Step | Delivers | Status |
+|---|------|----------|--------|
+| 1 | pgx pool, config, migration runner, `docker-compose`, `/readyz` checks the DB | The app boots against Postgres | done |
+| 2 | Migrations 0001–0006 + repository layer + integration tests | Schema exists, is exercised | done |
+| 3 | `auth` package: argon2id, sessions, middleware, rate limit | Login works via curl | |
+| 4 | Tracking service + JSON endpoints §8 | Full API, no UI | |
+| 5 | Poller: claim loop, per-platform pacing, backoff, `fetch_attempts` | History accumulates | |
+| 6 | Housekeeping: rollups, retention, partition creation | Bounded storage | |
+| 7 | YouTube `BatchProvider` | 50× less quota | |
+| 8 | `web` package: templates, SVG charts, pages | The dashboard | |
+| 9 | OpenAPI spec for the new routes, README, `.env.example` | Docs match reality | |
 
 Steps 1–4 are the useful minimum: accounts, tracking, and an API. Step 5 is what
 makes it a *dashboard* rather than a bookmark list.
