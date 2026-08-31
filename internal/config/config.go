@@ -40,12 +40,44 @@ type YouTubeConfig struct {
 func (c YouTubeConfig) Enabled() bool { return c.APIKey != "" }
 
 type MetaConfig struct {
+	// AccessToken is optional. It unlocks the Graph API path, which only works
+	// for objects the token's app administers; everything else is read from the
+	// public page. See internal/provider/meta.
 	AccessToken string
 	BaseURL     string
 	APIVersion  string
+
+	// On turns the provider off without removing it from the registry.
+	On bool
+
+	// PageFetch allows reading counters from public pages. Turning it off
+	// leaves only the Graph API path, which means Instagram stops working
+	// entirely and Facebook answers only for media the token administers.
+	// It exists because scraping is a deployment-level policy decision.
+	PageFetch bool
+
+	// UserAgent is sent on page fetches. Meta serves a stripped page to clients
+	// that do not look like a browser, so this must stay browser-like.
+	UserAgent string
+
+	// MaxAttempts bounds page fetch retries. Meta's failures are mostly
+	// permanent login walls rather than TikTok's random challenges, so retrying
+	// buys less here and the default is correspondingly lower.
+	MaxAttempts int
+
+	// RetryBackoff is the base delay between attempts; it grows linearly.
+	RetryBackoff time.Duration
 }
 
-func (c MetaConfig) Enabled() bool { return c.AccessToken != "" }
+// Enabled reports whether the provider should serve at all. Unlike YouTube this
+// is not tied to a credential: the public-page path needs none.
+func (c MetaConfig) Enabled() bool { return c.On }
+
+// HasToken reports whether the Graph API path is available.
+func (c MetaConfig) HasToken() bool { return c.AccessToken != "" }
+
+// PageFetchEnabled reports whether public pages may be read.
+func (c MetaConfig) PageFetchEnabled() bool { return c.PageFetch }
 
 type TikTokConfig struct {
 	// BaseURL is the TikTok web origin. Public video pages are the only source
@@ -73,6 +105,12 @@ type TikTokConfig struct {
 
 func (c TikTokConfig) Enabled() bool { return c.On }
 
+// defaultMetaUserAgent is a desktop Chrome UA. Meta is not as fussy about the
+// exact string as TikTok is, but a non-browser UA gets a stripped page with no
+// payload in it, so a plausible one is still required.
+const defaultMetaUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 // defaultTikTokUserAgent is a desktop Chrome UA. The exact string matters more
 // than it should: TikTok hard-blocks the canonical four-part version form
 // ("Chrome/124.0.0.0"), which is what most scraping libraries send, while the
@@ -99,9 +137,14 @@ func Load() (*Config, error) {
 			BaseURL: str("YOUTUBE_API_BASE_URL", "https://www.googleapis.com/youtube/v3"),
 		},
 		Meta: MetaConfig{
-			AccessToken: str("META_ACCESS_TOKEN", ""),
-			BaseURL:     str("META_API_BASE_URL", "https://graph.facebook.com"),
-			APIVersion:  str("META_API_VERSION", "v21.0"),
+			AccessToken:  str("META_ACCESS_TOKEN", ""),
+			BaseURL:      str("META_API_BASE_URL", "https://graph.facebook.com"),
+			APIVersion:   str("META_API_VERSION", "v21.0"),
+			On:           boolean("META_ENABLED", true),
+			PageFetch:    boolean("META_PAGE_FETCH", true),
+			UserAgent:    str("META_USER_AGENT", defaultMetaUserAgent),
+			MaxAttempts:  intVal("META_MAX_ATTEMPTS", 3),
+			RetryBackoff: dur("META_RETRY_BACKOFF", time.Second),
 		},
 		TikTok: TikTokConfig{
 			BaseURL:      str("TIKTOK_BASE_URL", "https://www.tiktok.com"),

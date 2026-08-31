@@ -1,8 +1,7 @@
 # socialstats
 
-An HTTP service that returns public view counts for a video URL. YouTube and
-TikTok are implemented; Meta (Facebook/Instagram) is wired into the router and
-lands behind the same interface.
+An HTTP service that returns public view counts for a video URL. YouTube,
+TikTok and Meta (Facebook + Instagram) are implemented behind one interface.
 
 Standard library only — no web framework, no ORM.
 
@@ -25,11 +24,13 @@ configuration's working directory is inside the repository. Alternatively, set
 ```bash
 curl "localhost:8080/v1/stats?url=https://youtu.be/dQw4w9WgXcQ"
 curl "localhost:8080/v1/stats?url=https://www.tiktok.com/@user/video/7249376077976472833"
+curl "localhost:8080/v1/stats?url=https://www.instagram.com/reel/Cx1y2z3AbCd/"
+curl "localhost:8080/v1/stats?url=https://www.facebook.com/watch/?v=1234567890"
 curl -XPOST localhost:8080/v1/stats -d '{"url":"https://www.youtube.com/shorts/dQw4w9WgXcQ"}'
 curl localhost:8080/healthz
 ```
 
-Only YouTube needs a credential. TikTok works with no setup.
+Only YouTube needs a credential. TikTok and Meta work with no setup.
 
 Interactive API reference: **<http://localhost:8080/docs>** (Swagger UI).
 Raw spec: **<http://localhost:8080/openapi.yaml>**.
@@ -96,6 +97,10 @@ Every response carries `X-Request-Id` (an inbound one is honoured) and
 Accepted YouTube URL forms: `watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`,
 `/live/`, `/v/`, `youtube-nocookie.com`, with or without scheme.
 
+Accepted Meta URL forms: Instagram `/p/`, `/reel/`, `/reels/`, `/tv/`, with or
+without a leading handle; Facebook `/watch/?v=`, `/reel/<id>`, `/<page>/videos/
+[slug/]<id>`, `video.php?v=`, and the `fb.watch` / `/share/v/` short links.
+
 ## Swagger / OpenAPI
 
 The OpenAPI 3.1 document lives at `internal/docs/openapi.yaml` and is compiled
@@ -135,10 +140,14 @@ spec, so adding an undocumented endpoint fails the build.
 |----------|--------|-----------|-------------|
 | YouTube  | Data API v3 (`videos.list`) | `YOUTUBE_API_KEY` | Reliable; 10,000 quota units/day |
 | TikTok   | Public video page state | none | ~90% per request, see below |
-| Meta     | not implemented | — | returns `501` |
+| Instagram | Login-free embed render | none | Good; embeds are a supported surface |
+| Facebook | Graph API, else public page | `META_ACCESS_TOKEN` (optional) | Patchy; login walls are common |
 
 TikTok returns `share_count` and `save_count` in addition to the common
 counters; YouTube does not expose those, so they are absent for YouTube videos.
+Facebook reports `share_count` when its page carries one. Instagram photo posts
+and carousels have no view count at all, so `view_count` is absent rather than
+zero — as it is anywhere a counter could not be measured.
 
 ### Why the TikTok provider scrapes
 
@@ -178,7 +187,65 @@ What that means in practice, all of it measured rather than assumed:
   it is the deploying party's decision, which is why `TIKTOK_ENABLED=false`
   turns it off and returns `503` for TikTok URLs.
 
-Clients should treat `502 upstream_blocked` on a TikTok URL as retryable.
+### Why the Meta provider works the way it does
+
+Meta has no public API that returns metrics for an arbitrary video URL. The
+Graph API only answers for objects the calling app has been granted — in
+practice media on Pages or Instagram Business accounts the token administers —
+and the public-data endpoints that once served view counts for any id were
+removed in Graph v3.0. oEmbed, the one endpoint that does take a public URL,
+returns embed markup and an author name, never a counter.
+
+So the provider has two paths, and picks per request:
+
+- **Graph API**, for Facebook, when `META_ACCESS_TOKEN` is set *and* the token
+  can see the object. Exact figures, no anti-bot exposure. A token that cannot
+  see the object answers `code 100, "Unsupported get request"`, which is the
+  normal case for third-party videos and falls through to the page path.
+- **Public page**, otherwise. Instagram counters come from the login-free embed
+  render (`/reel/<code>/embed/captioned/`), which still carries the post's
+  GraphQL `shortcode_media` payload; Facebook counters come from the Relay
+  payload on the public video page.
+
+Details worth knowing before you rely on it:
+
+- **Instagram is the more reliable half**, because the embed render exists to be
+  loaded by third-party sites — it is a supported product surface rather than
+  something the provider is sneaking past.
+- **Facebook shows a login wall for much of its catalogue.** That is reported as
+  `502 upstream_blocked`, not `404`, because the remedy differs: authenticate,
+  or accept the gap. A `404` would claim the video does not exist.
+- **The payloads are doubly-escaped.** Meta serialises JSON into a JSON string
+  inside a bootstrap script, so extraction unescapes first and then pulls out
+  balanced objects by key (`scan.go`) rather than modelling the whole document,
+  which changes shape constantly.
+- **Rendered figures are a last resort.** When no payload is present, Instagram's
+  `og:description` (`"1.2M views, 40,102 likes"`) is parsed, and the provider
+  logs a warning: abbreviated figures are rounded, so 1.2M comes back as
+  1,200,000 rather than the true value. Exact figures always win when available.
+- **Zero is never reported as a measurement.** Meta omits counters by sending
+  zero, so a zero counter is left absent, matching how `VideoStats` treats
+  hidden counters everywhere else.
+- **Egress matters, and it was not verifiable from the development network.**
+  Measured from a datacenter IP, `instagram.com` answered every post and embed
+  URL with a logged-out JavaScript shell carrying no payload and no OpenGraph
+  tags — under browser, `facebookexternalhit`, `Twitterbot` and `Googlebot`
+  user agents alike — so the extraction paths above are covered by unit tests
+  against realistic fixtures but have not been confirmed end to end. On such a
+  network the provider degrades exactly as designed, returning
+  `502 upstream_blocked` rather than a fabricated zero. Verify from your own
+  egress before depending on it, and expect a residential or proxied IP to be
+  the difference.
+- **It fails loudly.** A changed page structure returns `502 upstream_error`.
+- **Automated access to the public pages is contrary to Meta's Terms of
+  Service.** Whether to run it is the deploying party's decision:
+  `META_PAGE_FETCH=false` leaves only the Graph path (which disables Instagram
+  entirely), and `META_ENABLED=false` turns the provider off and returns `503`
+  for Meta URLs.
+
+Clients should treat `502 upstream_blocked` on a TikTok URL as retryable. On a
+Facebook URL it usually is not: it means a login wall, which will still be there
+on the retry.
 
 ## Layout
 
@@ -193,7 +260,7 @@ internal/
   httpx/                  server lifecycle, middleware, JSON envelopes
   provider/               registry that resolves a URL to its provider
     youtube/              YouTube Data API v3 + URL parsing
-    meta/                 matcher done, fetch pending credentials
+    meta/                 instagram embed + facebook page/graph extraction
     tiktok/               public page state extraction, with retry
   platform/httpclient/    shared outbound HTTP client
 ```
@@ -213,9 +280,9 @@ that maps a domain error onto an HTTP status.
 
 Nothing else changes — no handler, router, or service edits.
 
-For Meta and TikTok the matchers already exist, so those URLs return a clear
-`501 not_implemented` rather than `unsupported_platform`; filling in `Stats` is
-the only remaining work.
+A provider that is registered but switched off returns `503
+provider_unavailable` rather than `unsupported_platform`, so a caller can tell
+"this deployment does not run that platform" from "that URL is not a video".
 
 ## Operations
 

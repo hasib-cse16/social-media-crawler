@@ -69,8 +69,12 @@ func run() error {
 	}
 	providers = append(providers, yt)
 
-	// Meta and TikTok are registered unconditionally so their URLs get a clear
-	// 501/503 instead of "unsupported platform" while they are being built out.
+	// Meta and TikTok are registered even when disabled, so their URLs get a
+	// clear 503 rather than "unsupported platform".
+	//
+	// Meta shares the pooled client: unlike TikTok it does not decide
+	// per-connection whether to serve content, and its Graph API calls benefit
+	// from connection reuse.
 	providers = append(providers, meta.New(cfg.Meta, client, log))
 
 	// TikTok gets its own client: it decides per-connection whether to serve a
@@ -112,19 +116,29 @@ func run() error {
 	return nil
 }
 
-// handlerTimeout must cover the slowest provider. TikTok retries page fetches,
-// so its worst case is attempts x upstream timeout plus the backoff between them.
+// handlerTimeout must cover the slowest provider. The scraping providers retry
+// page fetches, so their worst case is attempts x upstream timeout plus the
+// backoff accumulated between them.
 func handlerTimeout(cfg *config.Config) time.Duration {
 	slowest := cfg.UpstreamTimeout
 
 	if cfg.TikTok.Enabled() {
-		attempts := time.Duration(max(cfg.TikTok.MaxAttempts, 1))
-		backoff := cfg.TikTok.RetryBackoff * attempts * (attempts + 1) / 2 // linear growth
-		if total := cfg.UpstreamTimeout*attempts + backoff; total > slowest {
-			slowest = total
-		}
+		slowest = max(slowest, retryBudget(cfg.UpstreamTimeout, cfg.TikTok.MaxAttempts, cfg.TikTok.RetryBackoff, 1))
+	}
+	if cfg.Meta.Enabled() {
+		// Instagram can fetch twice in one request: the embed render, then the
+		// post page when the embed carried no payload.
+		slowest = max(slowest, retryBudget(cfg.UpstreamTimeout, cfg.Meta.MaxAttempts, cfg.Meta.RetryBackoff, 2))
 	}
 	return slowest + 2*time.Second
+}
+
+// retryBudget is the worst-case wall time for a number of sequential page fetches,
+// each retried up to attempts times with linearly growing backoff.
+func retryBudget(upstream time.Duration, maxAttempts int, backoff time.Duration, fetches int) time.Duration {
+	attempts := time.Duration(max(maxAttempts, 1))
+	waited := backoff * attempts * (attempts + 1) / 2 // linear growth
+	return time.Duration(fetches) * (upstream*attempts + waited)
 }
 
 func cacheTTL() time.Duration {

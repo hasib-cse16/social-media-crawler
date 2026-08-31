@@ -7,15 +7,20 @@ info:
   description: |
     Give the service a video URL and it returns that video's public metrics.
 
-    YouTube and TikTok are implemented. Meta (Facebook/Instagram) URLs are
-    already routed to their provider and answer `501 not_implemented` until its
-    fetch is filled in, so clients can integrate against the final contract now.
+    YouTube, TikTok and Meta (Facebook + Instagram) are implemented.
 
     **Reliability differs by platform.** YouTube is read through the official
-    Data API and is reliable. TikTok has no API for arbitrary video URLs, so its
-    counters are read from the public video page; TikTok serves an anti-bot
-    challenge to a substantial share of requests, which the service retries.
-    Expect occasional `502 upstream_blocked` on TikTok URLs and retry.
+    Data API and is reliable. Neither TikTok nor Meta offers an API for
+    arbitrary video URLs, so their counters come from the public pages.
+
+    - TikTok serves an anti-bot challenge to a substantial share of requests,
+      which the service retries. Expect occasional `502 upstream_blocked` on
+      TikTok URLs, and retry — it usually succeeds.
+    - Instagram is read from its login-free embed render and is reasonably
+      reliable. Facebook prefers the Graph API when a token is configured and
+      can see the object, and otherwise reads the public page — for which
+      Facebook often serves a login wall instead. That is also
+      `502 upstream_blocked`, but retrying it will not help.
 
     **Counters are omitted rather than zeroed.** When an uploader hides the like
     or comment count, the field is absent from the response instead of being
@@ -63,6 +68,13 @@ paths:
             TikTok: `/@user/video/<id>`, `/@user/photo/<id>`, `/v/<id>.html`,
             and the `vm.tiktok.com` / `vt.tiktok.com` / `/t/<token>` short links
             (resolved by following redirects).
+
+            Instagram: `/p/<code>`, `/reel/<code>`, `/reels/<code>`,
+            `/tv/<code>`, with or without a leading handle.
+
+            Facebook: `/watch/?v=<id>`, `/reel/<id>`, `/<page>/videos/<id>`,
+            `/<page>/videos/<slug>/<id>`, `video.php?v=<id>`, and the
+            `fb.watch/<token>` / `/share/v/<token>` short links.
           schema:
             type: string
             format: uri
@@ -71,6 +83,8 @@ paths:
               - https://youtu.be/dQw4w9WgXcQ
               - https://www.youtube.com/shorts/dQw4w9WgXcQ
               - https://www.tiktok.com/@thebillionairebros/video/7249376077976472833
+              - https://www.instagram.com/reel/Cx1y2z3AbCd/
+              - https://www.facebook.com/watch/?v=1234567890
         - $ref: '#/components/parameters/RequestID'
       responses:
         '200': { $ref: '#/components/responses/Stats' }
@@ -193,8 +207,8 @@ components:
         title:
           type: string
           description: |
-            Video title. For TikTok this is the post caption, which can be long.
-            Omitted when the platform does not return one.
+            Video title. For TikTok and Instagram this is the post caption,
+            which can be long. Omitted when the platform does not return one.
         channel_id:
           type: string
           description: Id of the owning channel or account.
@@ -209,7 +223,10 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: Public view count.
+          description: |
+            Public view count. Absent when the platform has no such figure —
+            an Instagram photo post or carousel, for instance — or when it could
+            not be measured. Never reported as `0` on a guess.
           examples: [1500000000]
         like_count:
           type: integer
@@ -226,15 +243,15 @@ components:
           format: int64
           minimum: 0
           description: |
-            Public share count. TikTok reports this; YouTube does not expose it,
-            so it is absent for YouTube videos.
+            Public share count. TikTok always reports this and Facebook usually
+            does; YouTube and Instagram do not expose it, so it is absent there.
         save_count:
           type: integer
           format: int64
           minimum: 0
           description: |
             Times the video was saved or added to favourites. TikTok reports
-            this; YouTube does not expose it.
+            this; the other platforms do not expose it.
         fetched_at:
           type: string
           format: date-time
@@ -370,6 +387,39 @@ components:
                   save_count: 2732
                   fetched_at: '2026-08-27T11:29:20Z'
                   cached: false
+            instagram:
+              summary: An Instagram reel
+              value:
+                data:
+                  platform: meta
+                  video_id: Cx1y2z3AbCd
+                  canonical_url: https://www.instagram.com/reel/Cx1y2z3AbCd/
+                  title: Behind the scenes on assignment in Patagonia
+                  channel_id: '787132'
+                  channel_title: natgeo
+                  published_at: '2023-06-27T14:41:42Z'
+                  view_count: 220500
+                  like_count: 8702
+                  comment_count: 113
+                  fetched_at: '2026-08-27T11:31:04Z'
+                  cached: false
+            facebook:
+              summary: A public Facebook video
+              value:
+                data:
+                  platform: meta
+                  video_id: '1234567890'
+                  canonical_url: https://www.facebook.com/watch/?v=1234567890
+                  title: A public video
+                  channel_id: '555'
+                  channel_title: National Geographic
+                  published_at: '2023-06-27T14:41:42Z'
+                  view_count: 98765
+                  like_count: 4321
+                  comment_count: 42
+                  share_count: 17
+                  fetched_at: '2026-08-27T11:33:47Z'
+                  cached: false
             hiddenCounters:
               summary: Uploader hides likes and comments — the fields are absent
               value:
@@ -471,14 +521,16 @@ components:
     NotImplemented:
       description: |
         The URL was recognised as belonging to a platform whose fetch is not
-        built yet (currently Meta and TikTok). The route and contract are final.
+        built yet. Every platform in the `Platform` enum is implemented today,
+        so this is reserved for ones added to the router ahead of their fetch;
+        the route and contract are final when it is returned.
       headers:
         X-Request-Id: { $ref: '#/components/headers/XRequestID' }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           examples:
-            tiktok:
+            pending:
               value:
                 error:
                   code: not_implemented
@@ -491,10 +543,11 @@ components:
 
         - `upstream_error` — the platform's API returned an error the service
           could not classify further.
-        - `upstream_blocked` — the platform served an anti-bot challenge page
-          instead of content and the service exhausted its retries. Specific to
-          TikTok, whose counters come from the public page rather than an API;
-          retrying usually succeeds.
+        - `upstream_blocked` — the platform served an anti-bot challenge or a
+          login wall instead of content, and the service exhausted its retries.
+          It applies to the platforms read from public pages rather than an API.
+          On TikTok this is a random challenge and retrying usually succeeds; on
+          Facebook it is usually a login wall, which retrying will not clear.
       headers:
         X-Request-Id: { $ref: '#/components/headers/XRequestID' }
       content:
@@ -515,11 +568,18 @@ components:
                   code: upstream_blocked
                   message: the platform served an anti-bot challenge instead of content; retry later
                   request_id: 2b3d028dfea63146616e5ccc4d398546
+            loginWall:
+              summary: Facebook served a login wall; retrying will not help
+              value:
+                error:
+                  code: upstream_blocked
+                  message: the platform served an anti-bot challenge instead of content; retry later
+                  request_id: 9f0a1c7de2b34ac59a1e6b8d4f2c7a10
 
     ProviderUnavailable:
       description: |
-        A provider that handles this URL exists, but its credentials are not
-        configured on this deployment.
+        A provider that handles this URL exists, but it is switched off on this
+        deployment, or its credentials are not configured.
       headers:
         X-Request-Id: { $ref: '#/components/headers/XRequestID' }
       content:
