@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/foodibd/socialstats/internal/api"
+	"github.com/foodibd/socialstats/internal/auth"
 	"github.com/foodibd/socialstats/internal/config"
 	"github.com/foodibd/socialstats/internal/domain"
 	"github.com/foodibd/socialstats/internal/httpx"
@@ -23,6 +24,7 @@ import (
 	"github.com/foodibd/socialstats/internal/provider/youtube"
 	"github.com/foodibd/socialstats/internal/stats"
 	"github.com/foodibd/socialstats/internal/storage/postgres"
+	"github.com/foodibd/socialstats/internal/tracking"
 )
 
 // version is stamped at build time: -ldflags "-X main.version=$(git rev-parse --short HEAD)".
@@ -135,11 +137,29 @@ func run() error {
 	tiktokClient := httpclient.NewWithoutConnectionReuse(cfg.UpstreamTimeout)
 	providers = append(providers, tiktok.New(cfg.TikTok, tiktokClient, log))
 
+	authSvc, authMW, err := buildAuth(cfg, db, log)
+	if err != nil {
+		return err
+	}
+
 	registry := provider.NewRegistry(providers...)
 	cache := stats.NewCache(cacheTTL())
 	service := stats.NewService(registry, cache, log)
 
+	trackingSvc := tracking.NewService(
+		db.Videos(), db.Tracking(), db.Metrics(), registry,
+		tracking.Config{
+			MaxTrackedPerUser: cfg.Tracking.MaxPerUser,
+			AddTimeout:        cfg.Tracking.AddTimeout,
+			Policy: tracking.RefreshPolicy{
+				Interval:               cfg.Tracking.RefreshInterval,
+				MaxBackoff:             cfg.Tracking.MaxBackoff,
+				FailuresBeforeRetiring: cfg.Tracking.FailuresBeforeRetiring,
+			},
+		}, log)
+
 	go reapCache(ctx, cache, log)
+	go reapSessions(ctx, authSvc, db, log)
 
 	handler := api.NewRouter(
 		api.NewHandler(service, log, version, db),
@@ -147,6 +167,9 @@ func run() error {
 		api.RouterConfig{
 			HandlerTimeout: handlerTimeout(cfg),
 			DocsEnabled:    cfg.DocsEnabled,
+			Auth:           api.NewAuthHandler(authSvc, authMW),
+			Middleware:     authMW,
+			Tracking:       api.NewTrackingHandler(trackingSvc),
 		},
 	)
 
@@ -162,6 +185,79 @@ func run() error {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
+}
+
+// buildAuth assembles the authentication stack.
+func buildAuth(cfg *config.Config, db *postgres.DB, log *slog.Logger) (*auth.Service, *auth.Middleware, error) {
+	hasher := auth.NewHasher(auth.HashParams{
+		Time:       cfg.Auth.HashTime,
+		Memory:     cfg.Auth.HashMemoryKiB,
+		Threads:    cfg.Auth.HashThreads,
+		SaltLength: auth.DefaultHashParams.SaltLength,
+		KeyLength:  auth.DefaultHashParams.KeyLength,
+	}, cfg.Auth.HashConcurrency)
+
+	svc, err := auth.NewService(
+		db.Users(), db.Sessions(), db.RateLimits(), hasher,
+		auth.Config{
+			TTL:              cfg.Auth.SessionTTL,
+			IdleTTL:          cfg.Auth.SessionIdleTTL,
+			TouchInterval:    cfg.Auth.SessionTouchInterval,
+			RegistrationOpen: cfg.Auth.RegistrationOpen,
+			LoginAttempts:    cfg.Auth.LoginAttempts,
+			LoginWindow:      cfg.Auth.LoginWindow,
+			Cookie: auth.CookieConfig{
+				Name:   cfg.Auth.CookieName,
+				Secure: cfg.Auth.CookieSecure,
+				Domain: cfg.Auth.CookieDomain,
+				TTL:    cfg.Auth.SessionTTL,
+			},
+		}, log)
+	if err != nil {
+		return nil, nil, fmt.Errorf("auth: %w", err)
+	}
+
+	// Worth stating at startup: password hashing is deliberately expensive, and
+	// the memory ceiling is a number people are surprised by when they size a
+	// container.
+	log.Info("auth ready",
+		"argon2_memory_kib", cfg.Auth.HashMemoryKiB,
+		"argon2_concurrency", cfg.Auth.HashConcurrency,
+		"hash_memory_ceiling_mib", hasher.MemoryCeilingBytes()/(1<<20),
+		"cookie_secure", cfg.Auth.CookieSecure,
+		"registration_open", cfg.Auth.RegistrationOpen,
+	)
+	if !cfg.Auth.CookieSecure {
+		log.Warn("session cookies are not marked Secure; this is only safe in development",
+			"env", cfg.Env)
+	}
+
+	return svc, auth.NewMiddleware(svc, api.RespondError, cfg.Auth.TrustProxyHeaders), nil
+}
+
+// reapSessions deletes expired sessions and idle rate limit buckets.
+func reapSessions(ctx context.Context, svc *auth.Service, db *postgres.DB, log *slog.Logger) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n, err := svc.ReapSessions(ctx); err != nil {
+				log.ErrorContext(ctx, "session reaping failed", "error", err)
+			} else if n > 0 {
+				log.Debug("sessions reaped", "deleted", n)
+			}
+			// A bucket untouched for a day is full, and a full bucket is
+			// indistinguishable from no bucket at all.
+			if n, err := db.RateLimits().DeleteIdleBuckets(ctx, time.Now().Add(-24*time.Hour)); err != nil {
+				log.ErrorContext(ctx, "rate limit sweep failed", "error", err)
+			} else if n > 0 {
+				log.Debug("rate limit buckets reaped", "deleted", n)
+			}
+		}
+	}
 }
 
 // handlerTimeout must cover the slowest provider. The scraping providers retry

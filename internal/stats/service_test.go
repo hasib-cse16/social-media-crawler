@@ -17,6 +17,9 @@ type fakeProvider struct {
 
 func (f *fakeProvider) Platform() domain.Platform { return domain.PlatformYouTube }
 func (f *fakeProvider) Match(string) bool         { return true }
+func (f *fakeProvider) Identify(string) (domain.VideoRef, error) {
+	return domain.VideoRef{Platform: domain.PlatformYouTube, VideoID: "abc"}, nil
+}
 func (f *fakeProvider) Stats(context.Context, string) (*domain.VideoStats, error) {
 	f.calls++
 	if f.err != nil {

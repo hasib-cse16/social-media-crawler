@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/foodibd/socialstats/internal/config"
 	"github.com/foodibd/socialstats/internal/domain"
+	"github.com/foodibd/socialstats/internal/storage/postgres/pgtest"
 )
 
 // Integration tests. Half of what this package relies on — advisory locks,
@@ -25,14 +25,11 @@ import (
 func testDB(t *testing.T) *DB {
 	t.Helper()
 
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL is not set; run `make db-up && make test-db`")
-	}
-
+	// A private schema per test, so packages running in parallel cannot drop
+	// each other's tables mid-migration.
 	ctx := context.Background()
 	db, err := Connect(ctx, config.DatabaseConfig{
-		URL:             url,
+		URL:             pgtest.URL(t),
 		MaxConns:        8,
 		MinConns:        1,
 		MaxConnLifetime: time.Minute,
@@ -42,20 +39,10 @@ func testDB(t *testing.T) *DB {
 		t.Fatalf("connect to TEST_DATABASE_URL: %v", err)
 	}
 	t.Cleanup(db.Close)
-
-	// Every test starts from nothing, so a failed run cannot leave state that
-	// makes the next one pass or fail for the wrong reason.
-	if _, err := db.Pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
-		t.Fatalf("reset schema: %v", err)
-	}
 	return db
 }
 
 func TestConnectRejectsAnUnreachableDatabase(t *testing.T) {
-	if os.Getenv("TEST_DATABASE_URL") == "" {
-		t.Skip("TEST_DATABASE_URL is not set")
-	}
-
 	// Port 1 has nothing listening. The point is that Connect fails here rather
 	// than handing back a lazy pool that fails on the first real query.
 	_, err := Connect(context.Background(), config.DatabaseConfig{

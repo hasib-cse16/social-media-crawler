@@ -171,3 +171,17 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// Identify extracts the video id from rawURL. Every YouTube URL form carries
+// its id, so this never needs the network.
+func (p *Provider) Identify(rawURL string) (domain.VideoRef, error) {
+	id, err := ExtractVideoID(rawURL)
+	if err != nil {
+		return domain.VideoRef{}, err
+	}
+	return domain.VideoRef{
+		Platform:     domain.PlatformYouTube,
+		VideoID:      id,
+		CanonicalURL: CanonicalURL(id),
+	}, nil
+}

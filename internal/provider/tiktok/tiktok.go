@@ -338,3 +338,23 @@ func snippet(body []byte) string {
 	}
 	return s
 }
+
+// Identify extracts the item id from rawURL.
+//
+// Short links (vm.tiktok.com, vt.tiktok.com, /t/<token>) carry no id, so they
+// report ErrNeedsResolution rather than guessing: the id only exists after the
+// redirect has been followed.
+func (p *Provider) Identify(rawURL string) (domain.VideoRef, error) {
+	ref, err := ParseURL(rawURL)
+	if err != nil {
+		return domain.VideoRef{}, err
+	}
+	if ref.VideoID == "" {
+		return domain.VideoRef{}, fmt.Errorf("%w: %q is a tiktok short link", domain.ErrNeedsResolution, rawURL)
+	}
+	return domain.VideoRef{
+		Platform:     domain.PlatformTikTok,
+		VideoID:      ref.VideoID,
+		CanonicalURL: CanonicalURL(ref.Username, ref.VideoID),
+	}, nil
+}

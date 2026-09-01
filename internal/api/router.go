@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/foodibd/socialstats/internal/auth"
 	"github.com/foodibd/socialstats/internal/docs"
 	"github.com/foodibd/socialstats/internal/httpx"
 )
@@ -16,6 +17,16 @@ type RouterConfig struct {
 	// DocsEnabled exposes /docs and /openapi.yaml. Turn it off on deployments
 	// that must not publish their API surface.
 	DocsEnabled bool
+
+	// Auth serves the account endpoints and protects the rest. It is optional
+	// so the router stays usable in tests that are not about authentication.
+	Auth *AuthHandler
+
+	// Middleware attaches the caller's identity and enforces CSRF.
+	Middleware *auth.Middleware
+
+	// Tracking serves the dashboard's data endpoints.
+	Tracking *TrackingHandler
 }
 
 // NewRouter builds the fully wrapped application handler. Routes use the
@@ -27,6 +38,46 @@ func NewRouter(h *Handler, log *slog.Logger, cfg RouterConfig) http.Handler {
 	mux.HandleFunc("GET /readyz", h.Ready)
 	mux.HandleFunc("GET /v1/stats", h.GetStats)
 	mux.HandleFunc("POST /v1/stats", h.PostStats)
+
+	if cfg.Auth != nil && cfg.Middleware != nil {
+		mw := cfg.Middleware
+
+		// Registration and login are the two endpoints that must be reachable
+		// without already being signed in, so they carry their own rate limits
+		// rather than a session requirement.
+		mux.HandleFunc("POST /v1/auth/register", cfg.Auth.Register)
+		mux.HandleFunc("POST /v1/auth/login", cfg.Auth.Login)
+		mux.HandleFunc("POST /v1/auth/logout", cfg.Auth.Logout)
+
+		// Everything below needs an identity. Require is applied per route
+		// rather than to a prefix, because a route that is protected by being
+		// inside the right subtree stops being protected the moment someone
+		// adds one outside it.
+		mux.Handle("GET /v1/auth/me", mw.Require(http.HandlerFunc(cfg.Auth.Me)))
+		mux.Handle("POST /v1/auth/logout-all", mw.Require(http.HandlerFunc(cfg.Auth.LogoutEverywhere)))
+		mux.Handle("POST /v1/auth/password", mw.Require(http.HandlerFunc(cfg.Auth.ChangePassword)))
+	}
+
+	if cfg.Tracking != nil && cfg.Middleware != nil {
+		mw := cfg.Middleware
+
+		// Every tracking route is scoped to the caller, so Require is applied
+		// to each one individually. Protecting a subtree instead would mean the
+		// next route added outside it is silently public.
+		for pattern, handler := range map[string]http.HandlerFunc{
+			"GET /v1/videos":               cfg.Tracking.List,
+			"POST /v1/videos":              cfg.Tracking.Add,
+			"GET /v1/videos/{id}":          cfg.Tracking.Get,
+			"PATCH /v1/videos/{id}":        cfg.Tracking.Update,
+			"DELETE /v1/videos/{id}":       cfg.Tracking.Remove,
+			"GET /v1/videos/{id}/history":  cfg.Tracking.History,
+			"GET /v1/videos/{id}/attempts": cfg.Tracking.Attempts,
+			"POST /v1/videos/{id}/refresh": cfg.Tracking.Refresh,
+			"GET /v1/dashboard/summary":    cfg.Tracking.Summary,
+		} {
+			mux.Handle(pattern, mw.Require(handler))
+		}
+	}
 
 	if cfg.DocsEnabled {
 		ui := docs.UIHandler(docs.SpecPath)
@@ -50,10 +101,28 @@ func NewRouter(h *Handler, log *slog.Logger, cfg RouterConfig) http.Handler {
 		timeout = 15 * time.Second
 	}
 
-	return httpx.Chain(mux,
+	handler := http.Handler(mux)
+
+	// CSRF wraps the mux rather than individual routes so a new state-changing
+	// endpoint is covered the moment it is added, instead of the moment
+	// somebody remembers. It exempts safe methods and bearer-token requests
+	// itself; see auth.Middleware.CSRF.
+	if cfg.Middleware != nil {
+		handler = cfg.Middleware.CSRF(handler)
+	}
+
+	return httpx.Chain(handler,
 		httpx.RequestID,
 		httpx.Logger(log),
 		httpx.Recover(log),
 		httpx.Timeout(timeout),
 	)
+}
+
+// RespondError renders a domain error in the standard envelope. It is handed to
+// the auth middleware so that package can report failures in this transport's
+// format without importing it and creating a cycle.
+func RespondError(w http.ResponseWriter, r *http.Request, err error) {
+	status, code, message := httpErrorFor(err)
+	httpx.Error(w, r, status, code, message)
 }

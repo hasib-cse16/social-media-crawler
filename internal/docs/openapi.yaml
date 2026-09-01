@@ -129,6 +129,473 @@ paths:
         '503': { $ref: '#/components/responses/ProviderUnavailable' }
         '504': { $ref: '#/components/responses/UpstreamTimeout' }
 
+  /v1/videos:
+    get:
+      tags: [tracking]
+      summary: The caller's tracked videos
+      description: |
+        Returns the caller's list with each video's current counters and its
+        growth over the requested window.
+
+        `views_gained` is the current view count minus the last reading at or
+        before the window's start. It is **absent rather than zero** when there
+        is no baseline — a video added yesterday has no week-old reading — and
+        it is **signed**, because platforms revise view counts downward and a
+        negative is a real measurement.
+      operationId: listVideos
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      parameters:
+        - name: window
+          in: query
+          description: How far back the growth baseline is taken from. Max one year.
+          schema: { type: string, default: 168h, examples: ['24h', '168h'] }
+        - name: platform
+          in: query
+          schema: { $ref: '#/components/schemas/Platform' }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [views, gained, recent, title, fetched]
+            default: views
+        - name: sparkline
+          in: query
+          description: |
+            Attach this many recent readings to each entry, oldest first. Off by
+            default: it costs one query per video, which is fine for a page and
+            wasteful for a client that only wants the numbers.
+          schema: { type: integer, minimum: 0, maximum: 200, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200':
+          description: The caller's tracked videos.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VideoListEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      tags: [tracking]
+      summary: Track a video
+      description: |
+        Resolves the URL, records the video and starts tracking it for the
+        caller — then **fetches it immediately**, so the response carries real
+        numbers rather than an empty row that fills in within the next interval.
+
+        A failed first fetch still tracks the video and still returns `201`. The
+        failure is recorded on the row (`schedule.last_fetch_status`) and in the
+        fetch log, and the poller retries: a TikTok challenge at 14:03 is not a
+        reason to refuse to track a video.
+
+        The exception is short links (`vm.tiktok.com`, `fb.watch`,
+        `/share/...`), which carry no id until the redirect is followed. A
+        failed fetch there means the video genuinely cannot be identified, and
+        the request fails rather than tracking something unknown.
+      operationId: trackVideo
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TrackRequest' }
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/TrackRequest' }
+      responses:
+        '201':
+          description: |
+            Now tracked. Whether the first fetch succeeded is reported by the
+            entry's own fetch status, not by the status code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntryEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/LimitReached' }
+        '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /v1/videos/{id}:
+    parameters:
+      - $ref: '#/components/parameters/VideoID'
+    get:
+      tags: [tracking]
+      summary: One tracked video
+      operationId: getVideo
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The tracked video.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntryEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotTracked' }
+
+    patch:
+      tags: [tracking]
+      summary: Rename or annotate a tracked video
+      description: |
+        Changes only the fields that are sent. Omitting `notes` leaves the
+        existing notes alone; sending `""` clears them.
+
+        Both are per-user: two accounts tracking the same video keep their own
+        label and notes.
+      operationId: updateTrackedVideo
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTrackingRequest' }
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EntryEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotTracked' }
+
+    delete:
+      tags: [tracking]
+      summary: Stop tracking a video
+      description: |
+        Removes the video from the caller's list. The video and its entire
+        history survive: other accounts may be tracking it, and re-adding it
+        later restores both the collected history and the label.
+
+        Polling stops only when the last tracker leaves.
+      operationId: untrackVideo
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: Untracked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      untracked: { type: boolean }
+                      history_kept: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotTracked' }
+
+  /v1/videos/{id}/history:
+    get:
+      tags: [tracking]
+      summary: A video's readings over time
+      description: |
+        Returns the time series for one video.
+
+        `source` says where the figures came from, because the two are not
+        equivalent: `snapshots` are individual measurements, `daily_rollup` rows
+        summarise days whose raw data has since been expired. A `day` bucket
+        reads the rollup when one exists and falls back to the raw series when
+        it does not, rather than returning an empty chart that looks like the
+        video has no history.
+
+        Bucketing takes the **last** reading in each bucket, not an average:
+        these are cumulative counters, and the mean of two of them is not a
+        number the video ever had.
+      operationId: getVideoHistory
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      parameters:
+        - $ref: '#/components/parameters/VideoID'
+        - name: from
+          in: query
+          description: RFC 3339. Defaults to seven days before `to`.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: RFC 3339. Defaults to now.
+          schema: { type: string, format: date-time }
+        - name: bucket
+          in: query
+          schema: { type: string, enum: [raw, hour, day], default: raw }
+      responses:
+        '200':
+          description: The video's readings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistoryEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotTracked' }
+
+  /v1/videos/{id}/attempts:
+    get:
+      tags: [tracking]
+      summary: A video's recent fetch attempts
+      description: |
+        Every attempt to refresh this video, successful or not. This is how
+        "why is this number stale?" gets answered without reading logs.
+      operationId: getVideoAttempts
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      parameters:
+        - $ref: '#/components/parameters/VideoID'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+      responses:
+        '200':
+          description: Recent attempts, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttemptsEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotTracked' }
+
+  /v1/videos/{id}/refresh:
+    post:
+      tags: [tracking]
+      summary: Bring the next fetch forward
+      description: |
+        Schedules the video to be fetched on the next poll tick, for a caller
+        who does not want to wait for the interval.
+
+        It returns `202` because it queues rather than fetches. Fetching inline
+        on demand would let one impatient account spend the whole deployment's
+        TikTok and Meta budget, and the poller is already what paces platform
+        access.
+      operationId: refreshVideo
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      parameters:
+        - $ref: '#/components/parameters/VideoID'
+      responses:
+        '202':
+          description: Queued for the next poll tick.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      queued: { type: boolean }
+                      video: { $ref: '#/components/schemas/Entry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotTracked' }
+        '410':
+          description: |
+            The video has been retired: the platform said it no longer exists,
+            repeatedly. Its history is still readable; it is simply not fetched
+            any more.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/dashboard/summary:
+    get:
+      tags: [tracking]
+      summary: Headline figures for the caller
+      description: |
+        Totals, a per-platform breakdown, coverage, and the videos that moved
+        most over the window.
+
+        `stale` counts videos whose newest reading is older than twice their own
+        fetch interval — per video rather than one cutoff, because a six-hourly
+        YouTube video and a twelve-hourly TikTok video go stale at different
+        speeds and a single threshold would misreport one of them.
+      operationId: getDashboardSummary
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      parameters:
+        - name: window
+          in: query
+          schema: { type: string, default: 168h }
+        - name: movers
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 50, default: 5 }
+      responses:
+        '200':
+          description: The caller's headline figures.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SummaryEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account
+      description: |
+        Creates an account and signs it in. Accepts JSON or a form post.
+
+        Passwords must be at least 12 characters and are rejected if they appear
+        in the embedded breach list or contain the address's local part. There
+        are no composition rules: they produce `Password1!` and reject
+        `correct horse battery staple`, which is the wrong way round.
+
+        A duplicate address returns `409`, which does disclose that the address
+        already has an account. Avoiding that requires accepting the sign-up
+        silently and mailing the address instead, and this service sends no
+        mail — so the disclosure is documented rather than pretended away.
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201': { $ref: '#/components/responses/SignedIn' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in
+      description: |
+        Verifies a password and issues a session. Accepts JSON or a form post.
+
+        Every failure returns the same `401 invalid_credentials`, whether the
+        address is unknown, the password is wrong or the account is suspended —
+        and each path costs the same time, because an unknown address is still
+        hashed against a decoy. A faster "no such user" would be an
+        account-existence oracle that identical wording does not hide.
+
+        Failed attempts are limited per address and per source address, five per
+        fifteen minutes each. A `429` carries `Retry-After` computed from the
+        bucket's real refill rate. A successful sign-in clears the counter.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/SignedIn' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: End this session
+      description: |
+        Revokes the session the request was made with and clears the cookies.
+
+        Succeeds whether or not there was a session. Signing out is an
+        intention, and "you were not signed in" gives the caller nothing to act
+        on.
+      operationId: logout
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: Signed out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignedOutEnvelope' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/auth/logout-all:
+    post:
+      tags: [auth]
+      summary: End every session for this account
+      description: |
+        Revokes every session the account has, on every device.
+
+        This is what server-side sessions buy that a stateless signed token
+        would not: revocation is a DELETE, not a denylist that has to be
+        consulted on every request until the token would have expired anyway.
+      operationId: logoutEverywhere
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: Every session was revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignedOutEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/auth/password:
+    post:
+      tags: [auth]
+      summary: Change password
+      description: |
+        Verifies the current password and replaces it.
+
+        Every session is revoked, including the one making the request. The
+        usual reason to change a password is believing someone else has it, and
+        leaving their session signed in would make the change ceremonial.
+      operationId: changePassword
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+      responses:
+        '200':
+          description: Password changed and every session revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignedOutEnvelope' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/auth/me:
+    get:
+      tags: [auth]
+      summary: The signed-in account
+      operationId: getMe
+      security:
+        - sessionCookie: []
+        - bearerToken: []
+      responses:
+        '200':
+          description: The current account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /healthz:
     get:
       tags: [system]
@@ -160,7 +627,39 @@ paths:
         '503': { $ref: '#/components/responses/NotReady' }
 
 components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: ss_session
+      description: |
+        The session cookie set by register and login. HttpOnly, SameSite=Lax and
+        Secure outside development.
+
+        Requests authenticated this way must also pass the CSRF check on unsafe
+        methods: echo the readable CSRF cookie back in `X-CSRF-Token` or a
+        `csrf_token` form field.
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        The same session token, sent as `Authorization: Bearer <token>`. Login
+        returns it in the body for exactly this purpose.
+
+        Bearer requests are exempt from CSRF, and not as a convenience: CSRF
+        exists because browsers attach cookies to cross-site requests
+        automatically. They do not attach this header on a third party's behalf,
+        so the request cannot be forged.
+
   parameters:
+    VideoID:
+      name: id
+      in: path
+      required: true
+      description: |
+        The video's public uuid. Internal row ids are never exposed, so the ids
+        in these URLs cannot be enumerated.
+      schema: { type: string, format: uuid }
     RequestID:
       name: X-Request-Id
       in: header
@@ -294,6 +793,342 @@ components:
           description: Platforms registered in this deployment, in resolution order.
           items: { $ref: '#/components/schemas/Platform' }
 
+    TrackRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Any URL form the providers accept; see the /v1/stats parameter.
+          examples: ['https://www.tiktok.com/@user/video/7249376077976472833']
+        label:
+          type: string
+          description: The caller's own name for this video. Per-user, not shared.
+          examples: ['Q3 launch']
+
+    UpdateTrackingRequest:
+      type: object
+      description: |
+        Only the fields present are changed. Omit one to leave it alone; send an
+        empty string to clear it.
+      properties:
+        label: { type: string }
+        notes: { type: string }
+      minProperties: 1
+
+    TrackedVideo:
+      type: object
+      required: [id, platform, video_id, canonical_url, latest, first_seen_at]
+      properties:
+        id: { type: string, format: uuid }
+        platform: { $ref: '#/components/schemas/Platform' }
+        video_id:
+          type: string
+          description: The platform's own id. With `platform` it is the natural key.
+        canonical_url: { type: string, format: uri }
+        title: { type: string }
+        channel_id: { type: string }
+        channel_title: { type: string }
+        published_at: { type: string, format: date-time }
+        latest: { $ref: '#/components/schemas/Counters' }
+        latest_captured_at:
+          type: string
+          format: date-time
+          description: When `latest` was measured. Absent if never fetched.
+        first_seen_at: { type: string, format: date-time }
+
+    Counters:
+      type: object
+      description: |
+        Public metrics. Every field is optional, and absent means "this platform
+        does not report it, or the uploader hides it" — which is not the same
+        fact as zero. An Instagram photo post has no view count; reporting `0`
+        would make it look like a video nobody watched.
+      properties:
+        view_count: { type: integer, format: int64, minimum: 0 }
+        like_count: { type: integer, format: int64, minimum: 0 }
+        comment_count: { type: integer, format: int64, minimum: 0 }
+        share_count: { type: integer, format: int64, minimum: 0 }
+        save_count: { type: integer, format: int64, minimum: 0 }
+
+    Snapshot:
+      type: object
+      required: [captured_at]
+      description: One reading of a video's counters at a point in time.
+      allOf:
+        - $ref: '#/components/schemas/Counters'
+        - type: object
+          properties:
+            captured_at: { type: string, format: date-time }
+
+    DailyMetric:
+      type: object
+      required: [day, sample_count]
+      properties:
+        day: { type: string, format: date }
+        first_view_count: { type: integer, format: int64 }
+        last_view_count: { type: integer, format: int64 }
+        last_like_count: { type: integer, format: int64 }
+        last_comment_count: { type: integer, format: int64 }
+        last_share_count: { type: integer, format: int64 }
+        last_save_count: { type: integer, format: int64 }
+        view_delta:
+          type: integer
+          format: int64
+          description: |
+            Last minus first. **Signed**: platforms revise view counts downward,
+            so a negative here is a measurement, not corrupt data.
+        sample_count:
+          type: integer
+          description: |
+            How many raw readings this day summarises. A day with one sample has
+            a meaningless delta, and a chart should say so rather than drawing a
+            confident flat line across a gap in coverage.
+
+    Entry:
+      type: object
+      required: [video, added_at, fresh]
+      properties:
+        video: { $ref: '#/components/schemas/TrackedVideo' }
+        label: { type: string }
+        added_at: { type: string, format: date-time }
+        views_gained:
+          type: integer
+          format: int64
+          description: |
+            Current view count minus the baseline. Absent when there is no
+            baseline in the window, and signed, because counters are not
+            monotonic.
+        baseline_at:
+          type: string
+          format: date-time
+          description: |
+            When the reading `views_gained` was measured against was taken.
+            Without it the delta is uninterpretable: "+1,200 since some
+            unspecified point" is not a fact anyone can use.
+        sparkline:
+          type: array
+          description: Recent readings, oldest first. Only when `sparkline` was requested.
+          items: { $ref: '#/components/schemas/Snapshot' }
+        fresh:
+          type: boolean
+          description: |
+            Whether the latest reading is recent enough to show without a
+            caveat, measured against this video's own fetch interval rather than
+            a fixed cutoff.
+
+    EntryEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/Entry' }
+
+    VideoListEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [videos, count, window, limit, offset]
+          properties:
+            videos:
+              type: array
+              items: { $ref: '#/components/schemas/Entry' }
+            count: { type: integer }
+            window: { type: string }
+            limit: { type: integer }
+            offset: { type: integer }
+
+    HistoryEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [video, from, to, bucket, source]
+          properties:
+            video: { $ref: '#/components/schemas/TrackedVideo' }
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time }
+            bucket: { type: string, enum: [raw, hour, day] }
+            source:
+              type: string
+              enum: [snapshots, daily_rollup]
+              description: |
+                Where the figures came from. Raw snapshots are individual
+                measurements; daily rollup rows summarise days whose raw data
+                has been expired. A chart drawn from one has different
+                properties from a chart drawn from the other.
+            snapshots:
+              type: array
+              items: { $ref: '#/components/schemas/Snapshot' }
+            daily:
+              type: array
+              items: { $ref: '#/components/schemas/DailyMetric' }
+
+    FetchAttempt:
+      type: object
+      required: [platform, started_at, duration_ms, status]
+      properties:
+        platform: { $ref: '#/components/schemas/Platform' }
+        started_at: { type: string, format: date-time }
+        duration_ms: { type: integer }
+        status:
+          type: string
+          enum: [ok, not_found, blocked, rate_limited, timeout, error]
+        error_code: { type: string }
+        error_detail: { type: string }
+
+    AttemptsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [attempts]
+          properties:
+            attempts:
+              type: array
+              items: { $ref: '#/components/schemas/FetchAttempt' }
+
+    SummaryEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [tracked_videos, by_platform, total_views, views_gained, stale, unavailable, window]
+          properties:
+            tracked_videos: { type: integer }
+            by_platform:
+              type: object
+              additionalProperties: { type: integer }
+            total_views: { type: integer, format: int64 }
+            views_gained:
+              type: integer
+              format: int64
+              description: Summed across the caller's videos. Signed.
+            stale:
+              type: integer
+              description: |
+                Videos whose newest reading is older than twice their own fetch
+                interval.
+            unavailable:
+              type: integer
+              description: |
+                Videos retired because the platform said, repeatedly, that they
+                no longer exist. Their history is kept.
+            window: { type: string }
+            top_movers:
+              type: array
+              items: { $ref: '#/components/schemas/Entry' }
+
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, examples: ['you@example.com'] }
+        password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 128
+          description: |
+            At least 12 characters, counted in runes so a non-Latin passphrase
+            is not penalised for encoding to more bytes. Rejected if it appears
+            in the embedded breach list, contains the address's local part, or
+            is one repeated character.
+          examples: ['seven blue mountains rise']
+        display_name: { type: string, examples: ['Alice'] }
+        timezone:
+          type: string
+          description: IANA name, for display only. Nothing is stored in a local time.
+          examples: ['Europe/London']
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+
+    ChangePasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      properties:
+        current_password: { type: string, format: password }
+        new_password: { type: string, format: password, minLength: 12, maxLength: 128 }
+
+    User:
+      type: object
+      required: [id, email, timezone, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            The account's public identifier. Internal row ids are never exposed,
+            so account ids in URLs cannot be enumerated.
+        email: { type: string, format: email }
+        display_name: { type: string }
+        timezone: { type: string }
+        status: { type: string, enum: [active, suspended] }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: string, format: date-time }
+
+    UserEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/User' }
+
+    Session:
+      type: object
+      required: [user, token, csrf_token, expires_at]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        token:
+          type: string
+          description: |
+            The session token. Also set as an HttpOnly cookie; it is returned in
+            the body so a script can hold it and send it as a bearer token
+            without a cookie jar.
+
+            Only its SHA-256 reaches the database, so a dump does not yield live
+            sessions.
+        csrf_token:
+          type: string
+          description: |
+            Echo this in `X-CSRF-Token` or a `csrf_token` form field on unsafe
+            methods when authenticating with the cookie. Also set as a readable
+            (non-HttpOnly) cookie, which is what lets the page's own script read
+            it — it is not a credential on its own.
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Absolute expiry. A session also expires after a shorter idle period
+            measured from its last activity, so this is an upper bound.
+
+    SessionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: '#/components/schemas/Session' }
+
+    SignedOutEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [signed_out]
+          properties:
+            signed_out: { type: boolean }
+            sessions_revoked: { type: integer, format: int64 }
+            password_changed: { type: boolean }
+
     HealthEnvelope:
       type: object
       required: [data]
@@ -340,7 +1175,17 @@ components:
         | `invalid_body` | 400 | the JSON body was unreadable or had unknown fields |
         | `unsupported_platform` | 400 | no provider handles that host |
         | `route_not_found` | 404 | no such endpoint |
-        | `not_found` | 404 | the video is missing, private, or removed |
+        | `not_found` | 404 | the video or record is missing, private, or removed |
+        | `unauthenticated` | 401 | no valid session on the request |
+        | `invalid_credentials` | 401 | wrong email or password (the two are not distinguished) |
+        | `csrf_failed` | 403 | the csrf token was missing or did not match |
+        | `registration_closed` | 403 | sign-up is disabled on this deployment |
+        | `already_exists` | 409 | that email address already has an account |
+        | `too_many_attempts` | 429 | too many failed sign-ins; see `Retry-After` |
+        | `weak_password` | 400 | the password does not meet the minimum requirements |
+        | `limit_reached` | 422 | the account is at its tracking limit |
+        | `gone` | 410 | the video was retired; its history is still readable |
+        | `unresolved_short_link` | 502 | a short link's redirect could not be followed |
         | `rate_limited` | 429 | upstream quota exhausted — retry later |
         | `internal_error` | 500 | unexpected server fault |
         | `not_implemented` | 501 | the platform is recognised but not yet supported |
@@ -354,6 +1199,16 @@ components:
         - invalid_url
         - invalid_body
         - unsupported_platform
+        - unauthenticated
+        - invalid_credentials
+        - csrf_failed
+        - registration_closed
+        - already_exists
+        - too_many_attempts
+        - weak_password
+        - limit_reached
+        - gone
+        - unresolved_short_link
         - route_not_found
         - not_found
         - rate_limited
@@ -504,6 +1359,137 @@ components:
                   version: 1a2b3c4
                   checks:
                     database: unreachable
+
+    SignedIn:
+      description: |
+        A session was issued. The response sets the session and CSRF cookies and
+        also returns the token in the body for bearer use.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+        Set-Cookie:
+          description: The session cookie, and a second header with the CSRF cookie.
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SessionEnvelope' }
+          examples:
+            issued:
+              value:
+                data:
+                  user:
+                    id: 8ef47610-6d92-4a40-88e4-e4faf97380a1
+                    email: you@example.com
+                    display_name: Alice
+                    timezone: UTC
+                    status: active
+                    created_at: '2026-08-31T10:39:58Z'
+                  token: BL1uz0lFbLivHDZ5c36CyNbKTiwhyxYI96_MCeaWkfU
+                  csrf_token: Dz5nVIIwqvkQfHG3xsf_PbqR5NJDkt8I_n194ySy4Mw
+                  expires_at: '2026-09-30T10:39:58Z'
+
+    Unauthorized:
+      description: |
+        Not signed in, or the credentials were wrong.
+
+        `invalid_credentials` is returned for an unknown address, a wrong
+        password and a suspended account alike, so the endpoint cannot be used
+        to learn which of the three it was.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            badCredentials:
+              value:
+                error:
+                  code: invalid_credentials
+                  message: invalid email or password
+                  request_id: 4fba7d8d0838ef557fff84af4bd6d83d
+            notSignedIn:
+              value:
+                error:
+                  code: unauthenticated
+                  message: sign in to use this endpoint
+                  request_id: 0d8baf20a202350408789ab8e33b53b8
+
+    Forbidden:
+      description: |
+        The request was understood and refused. Either the CSRF check failed on
+        a cookie-authenticated write, or registration is closed here.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            csrf:
+              value:
+                error:
+                  code: csrf_failed
+                  message: the csrf token was missing or did not match
+                  request_id: c034335474cab0b94f7837a7eb56c38f
+            closed:
+              value:
+                error:
+                  code: registration_closed
+                  message: registration is closed on this deployment
+                  request_id: 8a1f2c9d4e6b70318a5c2d9e7f4b1a63
+
+    Conflict:
+      description: That email address already has an account.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            taken:
+              value:
+                error:
+                  code: already_exists
+                  message: that email address already has an account
+                  request_id: 4578b3dfd96037e2db9a9a112cf0bdde
+
+    NotTracked:
+      description: |
+        No such video on the caller's list.
+
+        A video the caller does not track returns `404` rather than `403`, so
+        the endpoint does not confirm that a video other people are tracking
+        exists.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            notTracked:
+              value:
+                error:
+                  code: not_found
+                  message: no such record
+                  request_id: 6f1c2a9d4e6b70318a5c2d9e7f4b1a63
+
+    LimitReached:
+      description: |
+        The account is at its tracking limit.
+
+        Tracking is what creates polling work, and polling work is spent against
+        upstream quota and anti-bot budgets that everyone on the deployment
+        shares — so one account cannot take all of it.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            full:
+              value:
+                error:
+                  code: limit_reached
+                  message: 'account limit reached: you are tracking 200 videos, the limit is 200'
+                  request_id: 91a0bcde2f3147a5b8c6d2e9f0a1b234
 
     Health:
       description: The service is up.

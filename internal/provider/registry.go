@@ -56,6 +56,17 @@ func (r *Registry) Platforms() []domain.Platform {
 	return out
 }
 
+// Identify resolves a URL to its platform-native identity without touching the
+// network. Short links come back with ErrNeedsResolution, which tells the
+// caller the id has to come from a fetch instead.
+func (r *Registry) Identify(rawURL string) (domain.VideoRef, error) {
+	p, err := r.For(rawURL)
+	if err != nil {
+		return domain.VideoRef{}, err
+	}
+	return p.Identify(rawURL)
+}
+
 // Stats is the single entry point used by the service layer.
 func (r *Registry) Stats(ctx context.Context, rawURL string) (*domain.VideoStats, error) {
 	p, err := r.For(rawURL)

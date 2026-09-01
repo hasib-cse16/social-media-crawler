@@ -3,9 +3,9 @@
 An HTTP service that returns public view counts for a video URL. YouTube,
 TikTok and Meta (Facebook + Instagram) are implemented behind one interface.
 
-Two dependencies: `pgx` (there is no PostgreSQL driver in the standard
-library) and nothing else yet. No web framework, no ORM, no migration tool —
-queries are hand-written SQL in `internal/storage/postgres`.
+Two dependencies: `pgx` (there is no PostgreSQL driver in the standard library)
+and `golang.org/x/crypto` (nor an argon2id). No web framework, no ORM, no
+migration tool — queries are hand-written SQL in `internal/storage/postgres`.
 
 ## Quick start
 
@@ -54,6 +54,21 @@ which is why responses are cached.
 |--------|---------------|-------------------------------------------|
 | GET    | `/v1/stats`   | `?url=<video url>`                        |
 | POST   | `/v1/stats`   | body `{"url":"..."}`                      |
+| GET    | `/v1/videos`        | the caller's tracked videos, with growth  |
+| POST   | `/v1/videos`        | `{url, label?}` — track it, fetching now  |
+| GET    | `/v1/videos/{id}`   | one tracked video                         |
+| PATCH  | `/v1/videos/{id}`   | `{label?, notes?}`                        |
+| DELETE | `/v1/videos/{id}`   | untrack; the history is kept              |
+| GET    | `/v1/videos/{id}/history` | `?from=&to=&bucket=raw\|hour\|day` |
+| GET    | `/v1/videos/{id}/attempts` | recent fetch attempts, successful or not |
+| POST   | `/v1/videos/{id}/refresh` | bring the next fetch forward       |
+| GET    | `/v1/dashboard/summary` | totals, coverage and top movers       |
+| POST   | `/v1/auth/register` | `{email, password, display_name?}` → session |
+| POST   | `/v1/auth/login`    | `{email, password}` → session             |
+| POST   | `/v1/auth/logout`   | ends this session                         |
+| POST   | `/v1/auth/logout-all` | ends every session for the account      |
+| POST   | `/v1/auth/password` | change password; revokes every session    |
+| GET    | `/v1/auth/me`       | the signed-in account                     |
 | GET    | `/healthz`    | liveness + registered platforms           |
 | GET    | `/readyz`     | readiness — 503 when the database is unreachable |
 | GET    | `/docs`       | Swagger UI                                |
@@ -109,6 +124,93 @@ Accepted YouTube URL forms: `watch?v=`, `youtu.be/`, `/shorts/`, `/embed/`,
 Accepted Meta URL forms: Instagram `/p/`, `/reel/`, `/reels/`, `/tv/`, with or
 without a leading handle; Facebook `/watch/?v=`, `/reel/<id>`, `/<page>/videos/
 [slug/]<id>`, `video.php?v=`, and the `fb.watch` / `/share/v/` short links.
+
+## Accounts
+
+Sign in with a cookie or a bearer token — the same endpoints serve both, which
+is what makes the API usable from a browser and from curl without either one
+getting in the other's way.
+
+```bash
+TOKEN=$(curl -s -XPOST localhost:8080/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"seven blue mountains rise"}' \
+  | jq -r .data.token)
+
+curl -s localhost:8080/v1/auth/me -H "Authorization: Bearer $TOKEN"
+```
+
+Login also sets an `HttpOnly` session cookie and a readable CSRF cookie. Which
+one you use decides whether CSRF applies: cookies are attached by the browser
+automatically and so can be forged cross-site, while a bearer header cannot be,
+so bearer requests skip the check. Cookie-authenticated writes must echo the
+CSRF cookie back in `X-CSRF-Token` or a `csrf_token` form field.
+
+A few properties worth knowing about:
+
+- **Passwords are argon2id** at 64 MiB, 3 passes. That cost is the point — it is
+  what makes an offline attack on a leaked table expensive — and it applies to
+  our own login path too, so concurrent hashing is capped
+  (`ARGON2_CONCURRENCY`, default 4) and the ceiling is logged at startup. Budget
+  256 MiB for it at the defaults.
+- **Raising the cost does not lock anyone out.** Each hash stores the parameters
+  it was made with, and the next successful login rehashes at the current ones —
+  the only moment the plaintext exists.
+- **Failed sign-ins are limited per email *and* per IP**, five per fifteen
+  minutes, in a Postgres token bucket so the limit holds across replicas rather
+  than being multiplied by the pod count. `429` responses carry a truthful
+  `Retry-After` computed from the bucket's refill rate. A successful sign-in
+  clears the counter.
+- **"No such account" and "wrong password" are indistinguishable**, in wording
+  and in timing: an unknown address is still hashed against a decoy, because
+  returning early would make the endpoint an account-existence oracle no
+  identical error text could hide.
+- **Sessions are server-side.** The database stores only `sha256(token)`, so a
+  dump does not yield live sessions — and "log out everywhere" and instant
+  revocation come for free, which a stateless signed token would have cost.
+
+## Tracking videos
+
+```bash
+curl -s -XPOST localhost:8080/v1/videos -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://www.tiktok.com/@user/video/7249376077976472833","label":"Q3 launch"}'
+
+curl -s "localhost:8080/v1/videos?sort=gained&window=168h&sparkline=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Adding a video **fetches it synchronously**, so the caller gets a number back
+rather than an empty row that fills in some time in the next six hours. If that
+first fetch fails the video is tracked anyway, with the failure recorded on the
+row and in the fetch log — a TikTok challenge at 14:03 is not a reason to refuse
+to track a video, and the poller will try again.
+
+The exception is short links (`vm.tiktok.com`, `fb.watch`). Those carry no id
+until the redirect is followed, so a failed fetch there means we genuinely do
+not know which video was meant, and the request fails.
+
+Details worth knowing:
+
+- **Growth is measured against a baseline, and the baseline is reported.**
+  `views_gained` is the current count minus the last reading at or before the
+  window's start, and `baseline_at` says when that reading was taken. It is
+  absent rather than zero when there is no baseline — a video added yesterday
+  has no week-old reading — and it is **signed**, because platforms revise view
+  counts downward and a negative is a measurement rather than a bug.
+- **A video is shared; the tracking of it is not.** Two accounts following the
+  same video share one row, one time series and one fetch, but keep their own
+  labels and notes. Untracking archives rather than deletes, so re-adding
+  restores both the label and the history.
+- **Ownership is checked, not assumed.** A video the caller does not track
+  returns `404`, not `403`, so the endpoint does not confirm that a video other
+  people are tracking exists.
+- **`POST /{id}/refresh` returns `202` and queues.** Fetching inline on demand
+  would let one impatient account spend everyone's TikTok budget; the poller is
+  what paces platform access.
+- **Freshness is judged per video.** A six-hourly YouTube video and a
+  twelve-hourly TikTok video go stale at different speeds, so `fresh` compares
+  against each video's own interval rather than one cutoff.
 
 ## Swagger / OpenAPI
 
@@ -267,8 +369,10 @@ internal/
   api/                    HTTP transport: handlers, router, error mapping
   docs/                   embedded OpenAPI 3.1 spec + Swagger UI handlers
   httpx/                  server lifecycle, middleware, JSON envelopes
+  auth/                   argon2id, sessions, CSRF, login rate limiting
+  tracking/               per-user video lists, growth, refresh policy
   storage/postgres/       pool, migrations, repositories (users, sessions,
-                          videos, tracking, metrics)
+                          videos, tracking, metrics, rate limits)
   provider/               registry that resolves a URL to its provider
     youtube/              YouTube Data API v3 + URL parsing
     meta/                 instagram embed + facebook page/graph extraction
@@ -330,10 +434,9 @@ make db-reset # destroy the dev database and rebuild from migrations
 make db-shell # psql against the dev database
 ```
 
-The schema and repository layer are in place (users, sessions, videos,
-tracked videos, the partitioned metric time series and the fetch audit trail).
-The HTTP surface for them lands with the auth and tracking steps; see
-`docs/dashboard-design.md` for the plan and the reasoning.
+The schema, accounts and the full tracking API are in place. The background
+poller and the dashboard UI follow; see `docs/dashboard-design.md` for the plan
+and the reasoning.
 
 Repository tests run against a real PostgreSQL rather than a mock, because
 most of what the storage layer relies on — advisory locks, transactional DDL,

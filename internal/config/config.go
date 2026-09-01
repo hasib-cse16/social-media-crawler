@@ -28,10 +28,92 @@ type Config struct {
 	DocsEnabled bool
 
 	Database DatabaseConfig
+	Auth     AuthConfig
+	Tracking TrackingConfig
 
 	YouTube YouTubeConfig
 	Meta    MetaConfig
 	TikTok  TikTokConfig
+}
+
+// AuthConfig covers sessions, password hashing and login abuse limits.
+type AuthConfig struct {
+	// SessionTTL is the absolute session lifetime.
+	SessionTTL time.Duration
+
+	// SessionIdleTTL expires a session that has gone quiet, so a forgotten
+	// sign-in on a shared machine does not stay usable for the full TTL.
+	SessionIdleTTL time.Duration
+
+	// SessionTouchInterval is how stale a session's last-activity timestamp
+	// must get before a request writes it again. Without a threshold, every
+	// authenticated request writes a row.
+	SessionTouchInterval time.Duration
+
+	CookieName string
+
+	// CookieSecure keeps cookies off plaintext connections. It is forced off in
+	// development: a Secure cookie is simply never sent over http, and the
+	// symptom — login succeeds, then every request is anonymous — is a
+	// genuinely confusing afternoon.
+	CookieSecure bool
+
+	// CookieDomain is empty for a host-only cookie unless sessions must be
+	// shared across subdomains.
+	CookieDomain string
+
+	// RegistrationOpen allows self-service sign-up.
+	RegistrationOpen bool
+
+	// LoginAttempts and LoginWindow bound failed sign-ins per email and per IP.
+	LoginAttempts int
+	LoginWindow   time.Duration
+
+	// HashMemoryKiB, HashTime and HashThreads are the argon2id cost. Raising
+	// them does not invalidate existing accounts: a hash carries the parameters
+	// it was made with, and the next successful login upgrades it.
+	HashMemoryKiB uint32
+	HashTime      uint32
+	HashThreads   uint8
+
+	// HashConcurrency bounds simultaneous password hashes. Each one holds
+	// HashMemoryKiB, so this is what caps the memory a burst of sign-ins can
+	// take: at the defaults, 4 x 64 MiB. Zero means one per CPU.
+	HashConcurrency int
+
+	// TrustProxyHeaders honours X-Forwarded-For for the client address.
+	//
+	// It must stay off unless a proxy really is in front. With it on and no
+	// proxy, any caller can set the header and choose which rate limit bucket
+	// to spend — which is to say, turn the per-IP limit off.
+	TrustProxyHeaders bool
+}
+
+// TrackingConfig bounds what tracking costs the deployment.
+type TrackingConfig struct {
+	// MaxPerUser caps one account's list.
+	//
+	// Tracking is what creates polling work, and polling work is spent against
+	// upstream quota and anti-bot budgets that everyone here shares. Without a
+	// cap, one account pasting a channel's back catalogue degrades the service
+	// for all of them.
+	MaxPerUser int
+
+	// AddTimeout bounds the synchronous fetch performed when a video is added,
+	// so a slow platform cannot hold a user-facing request open indefinitely.
+	AddTimeout time.Duration
+
+	// RefreshInterval is the base gap between successful fetches.
+	RefreshInterval time.Duration
+
+	// MaxBackoff caps the exponential growth after repeated failures.
+	MaxBackoff time.Duration
+
+	// FailuresBeforeRetiring is how many consecutive "this video does not
+	// exist" answers it takes to stop polling. More than one, because a single
+	// not-found can be a region block or a brief privacy toggle rather than a
+	// deleted video.
+	FailuresBeforeRetiring int
 }
 
 // DatabaseConfig describes the PostgreSQL connection. The dashboard stores
@@ -171,6 +253,29 @@ func Load() (*Config, error) {
 			ConnectTimeout:  dur("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
 			MigrateOnBoot:   boolean("MIGRATE_ON_BOOT", true),
 		},
+		Auth: AuthConfig{
+			SessionTTL:           dur("SESSION_TTL", 720*time.Hour),
+			SessionIdleTTL:       dur("SESSION_IDLE_TTL", 168*time.Hour),
+			SessionTouchInterval: dur("SESSION_TOUCH_INTERVAL", 5*time.Minute),
+			CookieName:           str("SESSION_COOKIE_NAME", "ss_session"),
+			CookieSecure:         boolean("SESSION_COOKIE_SECURE", true),
+			CookieDomain:         str("SESSION_COOKIE_DOMAIN", ""),
+			RegistrationOpen:     boolean("REGISTRATION_OPEN", true),
+			LoginAttempts:        intVal("LOGIN_ATTEMPTS", 5),
+			LoginWindow:          dur("LOGIN_WINDOW", 15*time.Minute),
+			HashMemoryKiB:        uint32(intVal("ARGON2_MEMORY_KIB", 64*1024)),
+			HashTime:             uint32(intVal("ARGON2_TIME", 3)),
+			HashThreads:          uint8(intVal("ARGON2_THREADS", 4)),
+			HashConcurrency:      intVal("ARGON2_CONCURRENCY", 4),
+			TrustProxyHeaders:    boolean("TRUST_PROXY_HEADERS", false),
+		},
+		Tracking: TrackingConfig{
+			MaxPerUser:             intVal("TRACKING_MAX_PER_USER", 200),
+			AddTimeout:             dur("TRACKING_ADD_TIMEOUT", 30*time.Second),
+			RefreshInterval:        dur("TRACKING_REFRESH_INTERVAL", 6*time.Hour),
+			MaxBackoff:             dur("TRACKING_MAX_BACKOFF", 24*time.Hour),
+			FailuresBeforeRetiring: intVal("TRACKING_FAILURES_BEFORE_RETIRING", 3),
+		},
 		YouTube: YouTubeConfig{
 			APIKey:  str("YOUTUBE_API_KEY", ""),
 			BaseURL: str("YOUTUBE_API_BASE_URL", "https://www.googleapis.com/youtube/v3"),
@@ -192,6 +297,13 @@ func Load() (*Config, error) {
 			MaxAttempts:  intVal("TIKTOK_MAX_ATTEMPTS", 4),
 			RetryBackoff: dur("TIKTOK_RETRY_BACKOFF", time.Second),
 		},
+	}
+
+	// A Secure cookie is never sent over http, so in development it would make
+	// every sign-in appear to work and then fail. Forced rather than merely
+	// defaulted, because the failure is confusing and the fix is not obvious.
+	if cfg.Env == "development" {
+		cfg.Auth.CookieSecure = false
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -220,6 +332,27 @@ func (c *Config) validate() error {
 	}
 	if c.Database.MinConns < 0 || c.Database.MinConns > c.Database.MaxConns {
 		return fmt.Errorf("DATABASE_MIN_CONNS must be between 0 and DATABASE_MAX_CONNS (%d)", c.Database.MaxConns)
+	}
+	if c.Auth.SessionTTL <= 0 {
+		return fmt.Errorf("SESSION_TTL must be positive")
+	}
+	if c.Auth.SessionIdleTTL <= 0 || c.Auth.SessionIdleTTL > c.Auth.SessionTTL {
+		return fmt.Errorf("SESSION_IDLE_TTL must be positive and no greater than SESSION_TTL (%s)", c.Auth.SessionTTL)
+	}
+	if c.Auth.CookieName == "" {
+		return fmt.Errorf("SESSION_COOKIE_NAME must not be empty")
+	}
+	// argon2id's own lower bound. Below it the algorithm still runs but stops
+	// being memory-hard, which is the entire reason it was chosen.
+	if c.Auth.HashMemoryKiB < 8*1024 {
+		return fmt.Errorf("ARGON2_MEMORY_KIB must be at least 8192 (8 MiB); %d is too weak to be worth the CPU",
+			c.Auth.HashMemoryKiB)
+	}
+	if c.Auth.HashTime < 1 {
+		return fmt.Errorf("ARGON2_TIME must be at least 1")
+	}
+	if c.Auth.HashThreads < 1 {
+		return fmt.Errorf("ARGON2_THREADS must be at least 1")
 	}
 	return nil
 }

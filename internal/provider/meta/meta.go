@@ -227,3 +227,22 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 		return nil
 	}
 }
+
+// Identify extracts the post's identity from rawURL.
+//
+// fb.watch and /share/ links carry no id, so they report ErrNeedsResolution:
+// the shortcode or object id only exists after the redirect is followed.
+func (p *Provider) Identify(rawURL string) (domain.VideoRef, error) {
+	ref, err := ParseURL(rawURL)
+	if err != nil {
+		return domain.VideoRef{}, err
+	}
+	if ref.Key() == "" {
+		return domain.VideoRef{}, fmt.Errorf("%w: %q is a meta short link", domain.ErrNeedsResolution, rawURL)
+	}
+	return domain.VideoRef{
+		Platform:     domain.PlatformMeta,
+		VideoID:      ref.Key(),
+		CanonicalURL: CanonicalURL(ref),
+	}, nil
+}

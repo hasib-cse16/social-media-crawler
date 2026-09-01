@@ -1,6 +1,6 @@
 # Dashboard design: per-user video tracking on PostgreSQL
 
-**Status:** approved; steps 1 and 2 implemented
+**Status:** approved; steps 1–4 implemented
 **Scope:** turn the stateless stats API into a multi-user dashboard that tracks
 view counts for YouTube, TikTok and Meta videos over time.
 
@@ -805,8 +805,8 @@ Each step ends with something that runs and is tested.
 |---|------|----------|--------|
 | 1 | pgx pool, config, migration runner, `docker-compose`, `/readyz` checks the DB | The app boots against Postgres | done |
 | 2 | Migrations 0001–0006 + repository layer + integration tests | Schema exists, is exercised | done |
-| 3 | `auth` package: argon2id, sessions, middleware, rate limit | Login works via curl | |
-| 4 | Tracking service + JSON endpoints §8 | Full API, no UI | |
+| 3 | `auth` package: argon2id, sessions, middleware, rate limit | Login works via curl | done |
+| 4 | Tracking service + JSON endpoints §8 | Full API, no UI | done |
 | 5 | Poller: claim loop, per-platform pacing, backoff, `fetch_attempts` | History accumulates | |
 | 6 | Housekeeping: rollups, retention, partition creation | Bounded storage | |
 | 7 | YouTube `BatchProvider` | 50× less quota | |

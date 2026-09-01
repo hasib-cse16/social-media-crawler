@@ -10,12 +10,17 @@ import (
 
 func partitionNames(t *testing.T, db *DB, ctx context.Context) []string {
 	t.Helper()
+	// Scoped to this test's own schema. Without the filter it would also count
+	// partitions belonging to another schema's metric_snapshots, and the count
+	// would depend on what else happens to be in the database.
 	rows, err := db.Pool.Query(ctx, `
 		SELECT c.relname
 		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_inherits i ON i.inhrelid = c.oid
 		JOIN pg_class p ON p.oid = i.inhparent
 		WHERE p.relname = 'metric_snapshots'
+		  AND n.nspname = current_schema()
 		ORDER BY c.relname`)
 	if err != nil {
 		t.Fatalf("list partitions: %v", err)

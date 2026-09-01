@@ -4,6 +4,7 @@ package httpx
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 )
@@ -51,4 +52,14 @@ func Error(w http.ResponseWriter, r *http.Request, status int, code, message str
 		Message:   message,
 		RequestID: RequestIDFrom(r.Context()),
 	}})
+}
+
+// Detail wraps a sentinel with a specific explanation.
+//
+// The sentinel decides the status code and the machine-readable error code; the
+// detail says which parameter was wrong and what would have been right. A 400
+// that only says "invalid url" leaves the caller guessing at which of five
+// query parameters it meant.
+func Detail(sentinel error, format string, args ...any) error {
+	return fmt.Errorf("%w: %s", sentinel, fmt.Sprintf(format, args...))
 }
