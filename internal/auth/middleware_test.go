@@ -184,9 +184,11 @@ func TestCSRF(t *testing.T) {
 		{"no cookie", csrfRequest(http.MethodPost, "", "abc123", true), http.StatusForbidden},
 		{"nothing submitted", csrfRequest(http.MethodPost, "abc123", "", true), http.StatusForbidden},
 
-		// A request with no session cookie is not cookie-authenticated, so
-		// there is nothing for a third-party site to ride on.
-		{"no session cookie at all", csrfRequest(http.MethodPost, "", "", false), http.StatusOK},
+		// Sign-in and sign-up have no session yet, and are checked anyway:
+		// leaving them out allows login CSRF, where an attacker signs the
+		// victim into an account the attacker controls.
+		{"form post with no session", csrfRequest(http.MethodPost, "abc123", "", false), http.StatusForbidden},
+		{"form post with no session, valid token", csrfRequest(http.MethodPost, "abc123", "abc123", false), http.StatusOK},
 	}
 
 	for _, tc := range tests {
@@ -200,22 +202,85 @@ func TestCSRF(t *testing.T) {
 	}
 }
 
-// A bearer token cannot be attached by a browser on a third party's behalf, so
-// such a request is not forgeable and does not need a CSRF token it would have
-// to be told to fetch first.
-func TestCSRFExemptsBearerRequests(t *testing.T) {
+// Two shapes of request prove they were not produced by a cross-site form, and
+// both must pass without a token — otherwise the JSON API becomes unusable from
+// any client that has not first fetched one.
+func TestCSRFExemptsRequestsThatCannotBeForged(t *testing.T) {
 	mw, _, _ := testMiddleware(t)
 	handler := mw.CSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("done"))
 	}))
 
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
-	req.Header.Set("Authorization", "Bearer some-token")
-	handler.ServeHTTP(rr, req)
+	tests := []struct {
+		name  string
+		build func() *http.Request
+	}{
+		{
+			// Browsers do not attach this header on a third party's behalf.
+			name: "bearer token",
+			build: func() *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+				req.Header.Set("Authorization", "Bearer some-token")
+				return req
+			},
+		},
+		{
+			// An HTML form can only send urlencoded, multipart or text/plain;
+			// application/json requires fetch, which is preflighted.
+			name: "json body",
+			build: func() *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+				req.Header.Set("Content-Type", "application/json")
+				req.AddCookie(&http.Cookie{Name: "ss_session", Value: "a-session"})
+				return req
+			},
+		},
+		{
+			name: "json body with a charset parameter",
+			build: func() *http.Request {
+				req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+				req.Header.Set("Content-Type", "application/json; charset=utf-8")
+				return req
+			},
+		},
+	}
 
-	if rr.Code != http.StatusOK {
-		t.Errorf("status = %d, want a bearer request to skip the csrf check", rr.Code)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, tc.build())
+			if rr.Code != http.StatusOK {
+				t.Errorf("status = %d, want the check skipped (body %s)", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+// The exemptions must not be a way around the check: a form-encoded post is
+// checked whatever else it carries.
+func TestCSRFStillChecksFormPosts(t *testing.T) {
+	mw, _, _ := testMiddleware(t)
+	handler := mw.CSRF(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("done"))
+	}))
+
+	for _, contentType := range []string{
+		"application/x-www-form-urlencoded",
+		"multipart/form-data; boundary=x",
+		"text/plain",
+		"",
+	} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		req.AddCookie(&http.Cookie{Name: "ss_session", Value: "a-session"})
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("content-type %q: status = %d, want 403", contentType, rr.Code)
+		}
 	}
 }
 

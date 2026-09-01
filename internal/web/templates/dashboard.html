@@ -1,0 +1,95 @@
+{{ define "main" }}
+{{ $d := .Data }}
+
+<h1>Your videos</h1>
+<p class="subtitle">Tracked view counts across YouTube, TikTok and Meta, refreshed on a schedule.</p>
+
+<dl class="summary">
+  <div class="stat">
+    <dt>Tracked</dt>
+    <dd>{{ $d.Summary.Tracked }}</dd>
+  </div>
+  <div class="stat">
+    <dt>Total views</dt>
+    <dd title="{{ $d.Summary.TotalExact }}">{{ $d.Summary.TotalViews }}</dd>
+  </div>
+  <div class="stat">
+    <dt>Gained · {{ windowLabel $d.Filters.Window }}</dt>
+    <dd class="{{ $d.Summary.GainedClass }}">{{ $d.Summary.Gained }}</dd>
+  </div>
+  <div class="stat">
+    <dt>Awaiting refresh</dt>
+    <dd>{{ $d.Summary.Stale }} <span class="unit">of {{ $d.Summary.Tracked }}</span></dd>
+  </div>
+  {{ if $d.Summary.Unavailable }}
+  <div class="stat">
+    <dt>Removed</dt>
+    <dd class="delta-down">{{ $d.Summary.Unavailable }}</dd>
+  </div>
+  {{ end }}
+</dl>
+
+<section class="panel" style="margin-bottom:20px">
+  <div class="panel-body">
+    <h2>Track a video</h2>
+    <form class="add-form" method="post" action="/videos">
+      <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+      <div class="grow">
+        <label for="url" class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Video URL</label>
+        <input id="url" name="url" type="url" required autocomplete="off" spellcheck="false"
+               placeholder="https://www.tiktok.com/@user/video/7249376077976472833">
+      </div>
+      <div class="label-field">
+        <label for="label" class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Label</label>
+        <input id="label" name="label" type="text" placeholder="Label (optional)" autocomplete="off">
+      </div>
+      <button type="submit" class="btn btn-primary">Track</button>
+    </form>
+    <p class="hint">
+      Paste any YouTube, TikTok, Instagram or Facebook link. It is fetched straight away, so you
+      will see a figure immediately — and if the platform refuses that first request, the video is
+      still tracked and retried on the next cycle.
+    </p>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2 style="margin:0">
+      {{ if $d.Videos }}{{ len $d.Videos }} {{ plural (len $d.Videos) "video" }}{{ else }}Nothing tracked yet{{ end }}
+    </h2>
+    {{ template "filters" $d.Filters }}
+  </div>
+
+  {{ if $d.Videos }}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Video</th>
+          <th scope="col">Platform</th>
+          <th scope="col" class="num">Views</th>
+          <th scope="col" class="num">{{ windowLabel $d.Filters.Window }}</th>
+          <th scope="col">Trend</th>
+          <th scope="col">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range $d.Videos }}{{ template "video_row" . }}{{ end }}
+      </tbody>
+    </table>
+  </div>
+  {{ else if $d.Empty }}
+  <div class="empty">
+    <h2>Nothing tracked yet</h2>
+    <p>Paste a video link above to start collecting its view count. Readings are taken on a
+       schedule, so a trend appears after the first couple of cycles.</p>
+  </div>
+  {{ else }}
+  <div class="empty">
+    <h2>No videos match these filters</h2>
+    <p>Try widening the platform filter, or <a href="/">clear the filters</a>.</p>
+  </div>
+  {{ end }}
+</section>
+{{ end }}

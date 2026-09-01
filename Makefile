@@ -4,6 +4,11 @@ VERSION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
 # Local defaults matching docker-compose.yml. A real DATABASE_URL in the
 # environment (or in .env) wins, so these only apply to bare `make` targets.
+# The race detector needs cgo and a C compiler. It is on by default because it
+# is worth having, and overridable because not every machine has a toolchain:
+#   make test RACE=
+RACE ?= -race
+
 DATABASE_URL      ?= postgres://socialstats:socialstats@localhost:5432/socialstats?sslmode=disable
 TEST_DATABASE_URL ?= postgres://socialstats:socialstats@localhost:5433/socialstats_test?sslmode=disable
 export DATABASE_URL
@@ -20,11 +25,13 @@ build: ## compile the api binary into ./bin
 run: ## run the api locally
 	go run $(PKG)
 
-test: ## run all tests with race detection (no database needed)
-	go test -race ./...
+test: ## run unit tests (no database needed); RACE= to drop the race detector
+	go test $(RACE) ./...
 
 test-db: ## run integration tests against the disposable test database
-	TEST_DATABASE_URL=$(TEST_DATABASE_URL) go test -race -count=1 ./internal/storage/... ./internal/auth/...
+	TEST_DATABASE_URL=$(TEST_DATABASE_URL) go test $(RACE) -count=1 \
+	  ./internal/storage/... ./internal/auth/... ./internal/tracking/... \
+	  ./internal/poller/... ./internal/web/...
 
 cover: ## run tests and open a coverage summary
 	go test -coverprofile=coverage.out ./...

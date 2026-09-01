@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/foodibd/socialstats/internal/domain"
@@ -123,23 +124,26 @@ var safeMethods = map[string]bool{
 // a browser *send* our cookies, but the same-origin policy stops them reading
 // one — so they cannot produce the matching echo.
 //
-// Two cases are exempt, for the same underlying reason:
+// What decides whether the check applies is the shape of the request, not
+// whether it is authenticated. Two exemptions, and each is a proof that the
+// request could not have been forged by a cross-site form:
 //
-//   - Safe methods, which change nothing.
-//   - Requests authenticated by an Authorization header rather than a cookie.
-//     CSRF exists because browsers attach cookies to cross-site requests
-//     automatically; they do not attach that header, so a script or a curl
-//     command using a bearer token is not forgeable and does not need a token
-//     it would have to be told to fetch first.
+//   - An Authorization header. Browsers do not attach one on a third party's
+//     behalf, so a script or a curl command using a bearer token is not
+//     forgeable and should not have to fetch a token first.
+//   - A JSON content type. An HTML form can only send urlencoded, multipart or
+//     text/plain; producing application/json requires fetch or XHR, which is
+//     preflighted cross-origin and blocked before it arrives. This is what
+//     keeps the JSON API usable from any client while the forms stay protected.
+//
+// Everything else — every form post this service serves, including sign-in and
+// sign-up before there is a session to protect — is checked. Leaving the
+// unauthenticated forms out would allow login CSRF: an attacker signs the
+// victim into an account the attacker controls, and everything the victim does
+// next is recorded there.
 func (m *Middleware) CSRF(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if safeMethods[r.Method] {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		_, fromCookie := TokenFromRequest(r, m.svc.cfg.Cookie.Name)
-		if !fromCookie {
+		if safeMethods[r.Method] || m.csrfExempt(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -169,6 +173,18 @@ func (m *Middleware) CSRF(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), csrfKey, cookie.Value)))
 	})
+}
+
+// csrfExempt reports whether a request has proved it is not a cross-site form
+// post. See CSRF for why each of these is sufficient.
+func (m *Middleware) csrfExempt(r *http.Request) bool {
+	if _, fromCookie := TokenFromRequest(r, m.svc.cfg.Cookie.Name); !fromCookie && r.Header.Get("Authorization") != "" {
+		return true
+	}
+
+	// Only the media type matters; parameters like "; charset=utf-8" do not.
+	contentType, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
+	return strings.TrimSpace(strings.ToLower(contentType)) == "application/json"
 }
 
 // IssueCSRF makes sure a browser session has a CSRF cookie, minting one when it

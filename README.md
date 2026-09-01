@@ -1,6 +1,7 @@
 # socialstats
 
-An HTTP service that returns public view counts for a video URL. YouTube,
+A dashboard and HTTP service for tracking public view counts. Paste a video
+URL, and it is refreshed on a schedule so you can see how it moves. YouTube,
 TikTok and Meta (Facebook + Instagram) are implemented behind one interface.
 
 Two dependencies: `pgx` (there is no PostgreSQL driver in the standard library)
@@ -31,6 +32,8 @@ configuration's working directory is inside the repository. Alternatively, set
 `YOUTUBE_API_KEY` in the run configuration's environment.
 
 ```bash
+open http://localhost:8080     # the dashboard
+
 curl "localhost:8080/v1/stats?url=https://youtu.be/dQw4w9WgXcQ"
 curl "localhost:8080/v1/stats?url=https://www.tiktok.com/@user/video/7249376077976472833"
 curl "localhost:8080/v1/stats?url=https://www.instagram.com/reel/Cx1y2z3AbCd/"
@@ -54,6 +57,9 @@ which is why responses are cached.
 |--------|---------------|-------------------------------------------|
 | GET    | `/v1/stats`   | `?url=<video url>`                        |
 | POST   | `/v1/stats`   | body `{"url":"..."}`                      |
+| GET    | `/`                 | the dashboard                             |
+| GET    | `/videos/{id}`      | one video: chart, fetch log, notes        |
+| GET    | `/login`, `/register`, `/settings` | account pages              |
 | GET    | `/v1/videos`        | the caller's tracked videos, with growth  |
 | POST   | `/v1/videos`        | `{url, label?}` — track it, fetching now  |
 | GET    | `/v1/videos/{id}`   | one tracked video                         |
@@ -256,6 +262,58 @@ able to see that videos are quietly not being refreshed.
 Set `POLL_ENABLED=false` to run web replicas that serve traffic and one worker
 replica that polls.
 
+## The dashboard
+
+Server-rendered HTML from the same binary. No build step, no `node_modules`,
+nothing fetched from a CDN — the binary *is* the frontend, which means the
+dashboard cannot be broken by an upstream package release and works with
+JavaScript disabled.
+
+```
+internal/web/
+  web.go         server, template parsing, embedded assets
+  routes.go      route table and content negotiation
+  handlers.go    one handler per page
+  present.go     input whitelists and human-readable error copy
+  view.go        view models the templates receive
+  chart.go       SVG sparklines and history charts, generated in Go
+  format.go      counts, deltas, relative times
+  templates/     layout, pages, partials — parsed once at boot
+  static/        app.css, app.js
+```
+
+**Templates are parsed at startup.** A typo fails the process where a deploy
+notices, rather than on the one page nobody opened before release; the pages
+are rendered into a buffer first, so a template error cannot leave a half-page
+already sent with a `200`.
+
+**Charts are inline SVG generated in Go.** A sparkline is a polyline; the detail
+chart adds a labelled scale and marks each individual reading, so a chart drawn
+from four points does not pretend to the smoothness of one drawn from four
+hundred. Readings the platform did not report are *skipped*, never plotted as
+zero — a gap drawn as a fall to zero and back would look like the video lost
+every view it had.
+
+**One middleware protects both surfaces; only the presentation differs.** A
+browser navigating to a page it needs an account for is redirected to sign in,
+with the destination remembered; a script calling the same URL gets a `401` it
+can branch on. The request decides, using `Sec-Fetch-Mode` with `Accept` as the
+fallback — a redirect to an HTML login form is useless to an API client.
+
+**Every form posts and redirects.** A refresh does not resubmit, and the back
+button behaves. The message that survives the redirect rides in a short-lived
+cookie, cleared as it is read.
+
+**JavaScript is progressive enhancement only.** The filters are a GET form with
+a submit button that is hidden when scripting is available; the script adds
+auto-submit on change and a confirmation on "stop tracking". Every view has a
+shareable URL, and nothing on the page depends on the file loading.
+
+Both light and dark themes are derived from one set of custom properties, so a
+component never picks a colour that works in only one of them. Status carries a
+coloured stripe as well as a hue, so "needs attention" reads without relying on
+colour vision.
+
 ## Swagger / OpenAPI
 
 The OpenAPI 3.1 document lives at `internal/docs/openapi.yaml` and is compiled
@@ -416,6 +474,9 @@ internal/
   auth/                   argon2id, sessions, CSRF, login rate limiting
   tracking/               per-user video lists, growth, refresh policy
   poller/                 claim loop, per-platform pacing, backoff
+  web/                    server-rendered dashboard
+    templates/            html/template pages and partials, embedded
+    static/               one stylesheet, one script, embedded
   storage/postgres/       pool, migrations, repositories (users, sessions,
                           videos, tracking, metrics, rate limits)
   provider/               registry that resolves a URL to its provider
@@ -462,7 +523,15 @@ provider_unavailable` rather than `unsupported_platform`, so a caller can tell
 - Panics are recovered per request and logged with a stack.
 - The cache is per-process; swap `stats.Cache` for Redis behind `Get`/`Set`
   when running more than one replica.
-- Boot fails fast if `YOUTUBE_API_KEY` is missing.
+- Boot fails fast if `YOUTUBE_API_KEY` or `DATABASE_URL` is missing.
+- **Static assets carry a content hash** and are served `immutable` with a
+  one-year max-age; a changed file is a changed URL, so a deploy invalidates
+  caches without anyone remembering to bump a version. Pages themselves are
+  `no-store`: they are per-account and must not be held by a shared proxy.
+- **Set `SESSION_COOKIE_SECURE=true` behind TLS** — it is forced off only when
+  `APP_ENV=development`, because a `Secure` cookie is never sent over plain
+  HTTP and the symptom (sign-in appears to work, every page is then anonymous)
+  is a confusing afternoon.
 
 ## Development
 
@@ -479,10 +548,13 @@ make db-reset # destroy the dev database and rebuild from migrations
 make db-shell # psql against the dev database
 ```
 
-The schema, accounts, the tracking API and the background poller are in place,
-so history accumulates on its own. Retention and rollups, YouTube batching and
-the dashboard UI follow; see `docs/dashboard-design.md` for the plan and the
-reasoning.
+The schema, accounts, the tracking API, the background poller and the dashboard
+are in place. Retention and rollups, and YouTube's batched fetch, follow; see
+`docs/dashboard-design.md` for the plan and the reasoning.
+
+Both targets run with the race detector, which needs cgo and a C compiler. On a
+machine without one, `make test RACE=` and `make test-db RACE=` run the same
+tests without it.
 
 Repository tests run against a real PostgreSQL rather than a mock, because
 most of what the storage layer relies on — advisory locks, transactional DDL,
@@ -490,7 +562,35 @@ SQLSTATE codes, `SKIP LOCKED` — is behaviour a mock would only assert back at
 us. They skip themselves when `TEST_DATABASE_URL` is unset, so `make test`
 stays fast and dependency-free.
 
-## Not included (deliberate next steps)
+## Not built yet
 
-Auth on the API itself, per-caller rate limiting, retry with backoff on 5xx,
-Prometheus metrics, and persistence for historical view-count tracking.
+Named honestly, because a list of what is missing is more useful than a list of
+what is done.
+
+**Next, and load bearing before this is busy:**
+
+- **Retention and rollups** (step 6 in the design). Raw snapshots are meant to
+  age out after 30 days into `metric_daily`, and monthly partitions are meant to
+  be dropped rather than deleted. The schema and the SQL for both exist and are
+  tested; nothing runs them on a schedule, so storage grows without bound and
+  charts longer than the raw window fall back to the raw series.
+- **YouTube batching** (step 7). `videos.list` takes 50 ids per quota unit, so
+  batching is the difference between 10,000 and 500,000 refreshes a day. The
+  poller fetches one at a time.
+
+**Deliberate omissions, with the reasoning:**
+
+- **Per-caller rate limiting on the API.** Only the sign-in path is limited
+  today. The tracking endpoints are bounded by the per-account video cap, which
+  is what actually protects upstream budgets; a request limit protects the
+  database, and that is not the scarce resource yet.
+- **Metrics and tracing.** The audit trail answers "is TikTok degrading?" and
+  the logs are structured, which covers the questions that have come up. A
+  Prometheus endpoint is a small change when somebody has a dashboard to put it
+  on.
+- **Email.** No verification, no password reset, no notifications. This is why
+  registration discloses that an address already has an account — the
+  alternative needs somewhere to send a message to.
+- **Cursor pagination.** The video list is limit/offset. At a few hundred rows
+  per account that is honest; a cursor matters when the list is long enough to
+  shift under the reader, and it is not.

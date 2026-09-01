@@ -1,0 +1,72 @@
+{{ define "main" }}
+<h1>Settings</h1>
+<p class="subtitle">Your account.</p>
+
+<div class="detail-grid">
+  <div>
+    <section class="panel" style="margin-bottom:20px">
+      <div class="panel-head"><h2 style="margin:0">Profile</h2></div>
+      <div class="panel-body">
+        <form method="post" action="/settings">
+          <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+          <div class="field">
+            <label for="display_name">Name</label>
+            <input id="display_name" name="display_name" type="text" value="{{ .User.DisplayName }}">
+          </div>
+          <div class="field">
+            <label for="timezone">Time zone</label>
+            <select id="timezone" name="timezone">
+              {{ range .Data.Timezones }}<option value="{{ .Value }}"{{ if .Selected }} selected{{ end }}>{{ .Label }}</option>{{ end }}
+            </select>
+            <p class="hint">Used for display only — every reading is stored in UTC.</p>
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm">Save profile</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2 style="margin:0">Password</h2></div>
+      <div class="panel-body">
+        <form method="post" action="/settings/password">
+          <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+          <div class="field">
+            <label for="current_password">Current password</label>
+            <input id="current_password" name="current_password" type="password" required
+                   autocomplete="current-password">
+          </div>
+          <div class="field">
+            <label for="new_password">New password</label>
+            <input id="new_password" name="new_password" type="password" required minlength="12"
+                   autocomplete="new-password">
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm">Change password</button>
+          <p class="hint">
+            Changing your password signs you out everywhere, including here. That is deliberate:
+            the usual reason to change one is thinking somebody else has it.
+          </p>
+        </form>
+      </div>
+    </section>
+  </div>
+
+  <aside>
+    <section class="panel">
+      <div class="panel-head"><h2 style="margin:0">Account</h2></div>
+      <div class="panel-body">
+        <dl class="meta-list">
+          <dt>Email</dt><dd>{{ .User.Email }}</dd>
+          <dt>Joined</dt><dd title="{{ timestamp .Data.JoinedAt }}">{{ .Data.Joined }}</dd>
+          <dt>Tracking</dt><dd>{{ .Data.Tracked }} {{ plural .Data.Tracked "video" }}</dd>
+        </dl>
+
+        <form method="post" action="/logout-all" style="margin-top:16px"
+              data-confirm="Sign out of every device, including this one?">
+          <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+          <button type="submit" class="btn btn-sm">Sign out everywhere</button>
+        </form>
+      </div>
+    </section>
+  </aside>
+</div>
+{{ end }}

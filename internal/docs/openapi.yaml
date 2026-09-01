@@ -22,6 +22,17 @@ info:
       Facebook often serves a login wall instead. That is also
       `502 upstream_blocked`, but retrying it will not help.
 
+    **There is a dashboard too.** The same binary serves a server-rendered UI at
+    `/`, sharing these endpoints' service layer, session cookies and CSRF token.
+    This document covers the JSON API only; the HTML pages are not part of the
+    contract and may change freely.
+
+    **Two ways to authenticate, and the choice matters.** A session cookie or an
+    `Authorization: Bearer` header — login returns the token in the body for the
+    second. Cookie-authenticated writes must echo the CSRF token; bearer and
+    JSON-bodied requests are exempt, because neither can be produced by a
+    cross-site form. See the security schemes below.
+
     **Counters are omitted rather than zeroed.** When an uploader hides the like
     or comment count, the field is absent from the response instead of being
     reported as `0`.
@@ -650,6 +661,11 @@ components:
         exists because browsers attach cookies to cross-site requests
         automatically. They do not attach this header on a third party's behalf,
         so the request cannot be forged.
+
+        A request with an `application/json` body is exempt for the same kind of
+        reason: an HTML form can only send urlencoded, multipart or text/plain,
+        so a JSON content type is itself proof the request did not come from
+        one. Every form-encoded write is checked, including sign-in and sign-up.
 
   parameters:
     VideoID:

@@ -27,6 +27,22 @@ type RouterConfig struct {
 
 	// Tracking serves the dashboard's data endpoints.
 	Tracking *TrackingHandler
+
+	// Web registers the server-rendered dashboard. It is optional: a deployment
+	// can serve the JSON API alone.
+	Web WebRoutes
+}
+
+// WebRoutes is the dashboard's route registration, declared as an interface so
+// this package does not import the web package. The dependency runs one way —
+// the composition root wires them together — which keeps the JSON API buildable
+// and testable without the dashboard.
+type WebRoutes interface {
+	Routes(mux *http.ServeMux, mw *auth.Middleware)
+
+	// NotFoundHandler renders unknown paths, deferring to the JSON fallback for
+	// callers that are not browsers.
+	NotFoundHandler(jsonFallback http.HandlerFunc) http.HandlerFunc
 }
 
 // NewRouter builds the fully wrapped application handler. Routes use the
@@ -94,7 +110,21 @@ func NewRouter(h *Handler, log *slog.Logger, cfg RouterConfig) http.Handler {
 		mux.Handle("GET /swagger/", http.RedirectHandler("/docs", http.StatusMovedPermanently))
 	}
 
-	mux.HandleFunc("/", h.NotFound)
+	if cfg.Web != nil && cfg.Middleware != nil {
+		cfg.Web.Routes(mux, cfg.Middleware)
+	}
+
+	// The catch-all. Registered last so every real route wins, and it is a bare
+	// "/" rather than "GET /" so an unknown path answers the same way whatever
+	// method was used.
+	//
+	// A browser gets the site's own 404 page; anything else gets the JSON error
+	// shape, so a 404 from a script still parses like every other error.
+	notFound := h.NotFound
+	if cfg.Web != nil {
+		notFound = cfg.Web.NotFoundHandler(h.NotFound)
+	}
+	mux.HandleFunc("/", notFound)
 
 	timeout := cfg.HandlerTimeout
 	if timeout <= 0 {

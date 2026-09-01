@@ -1,6 +1,6 @@
 # Dashboard design: per-user video tracking on PostgreSQL
 
-**Status:** approved; steps 1–5 implemented
+**Status:** approved; steps 1–5 and 8 implemented
 **Scope:** turn the stateless stats API into a multi-user dashboard that tracks
 view counts for YouTube, TikTok and Meta videos over time.
 
@@ -436,11 +436,29 @@ what stops it being a denial-of-service vector.
 
 ### 5.3 CSRF
 
-Cookie-authenticated form posts need CSRF protection. Double-submit: a random
-token in a `__Host-csrf` cookie and in a hidden form field, compared on every
-unsafe method. `SameSite=Lax` already blocks the common cases; the token covers
-the rest. JSON endpoints called with a bearer session token instead of a cookie
-skip the check, since the attack does not apply there.
+Form posts need CSRF protection. Double-submit: a random token in a
+`__Host-csrf` cookie and in a hidden form field, compared on every unsafe
+method. `SameSite=Lax` already blocks the common cases; the token covers the
+rest.
+
+**Revised while building the forms.** This section originally scoped the check
+to *cookie-authenticated* requests, which reads sensibly and is wrong: sign-in
+and sign-up have no session yet, so they would have been exempt — and login CSRF
+is a real attack, where an attacker signs the victim into an account the
+attacker controls and everything the victim does next is recorded there.
+
+What the check keys on is the shape of the request, not whether it is
+authenticated. Two exemptions, each a proof the request could not have come from
+a cross-site form:
+
+- **An `Authorization` header.** Browsers do not attach one on a third party's
+  behalf.
+- **A JSON content type.** An HTML form can only send urlencoded, multipart or
+  text/plain; `application/json` requires fetch, which is preflighted
+  cross-origin and blocked before it arrives.
+
+Everything else is checked, including the unauthenticated forms. This is also
+what keeps the JSON API usable from any client without first fetching a token.
 
 ### 5.4 Abuse resistance
 
@@ -810,11 +828,18 @@ Each step ends with something that runs and is tested.
 | 5 | Poller: claim loop, per-platform pacing, backoff, `fetch_attempts` | History accumulates | done |
 | 6 | Housekeeping: rollups, retention, partition creation | Bounded storage | |
 | 7 | YouTube `BatchProvider` | 50× less quota | |
-| 8 | `web` package: templates, SVG charts, pages | The dashboard | |
+| 8 | `web` package: templates, SVG charts, pages | The dashboard | done |
 | 9 | OpenAPI spec for the new routes, README, `.env.example` | Docs match reality | |
 
 Steps 1–4 are the useful minimum: accounts, tracking, and an API. Step 5 is what
 makes it a *dashboard* rather than a bookmark list.
+
+Step 8 was brought forward ahead of 6 and 7 at the request of whoever is reading
+this: the UI is what makes the rest demonstrable, and neither housekeeping nor
+YouTube batching changes its shape. Retention (6) matters once the raw window is
+older than 30 days, and batching (7) matters once there are more than a few
+hundred YouTube videos — neither is urgent at current volumes, but both are load
+bearing before this is busy.
 
 ---
 

@@ -1,0 +1,12 @@
+{{ define "main" }}
+<div class="auth">
+  <section class="panel">
+    <div class="panel-body" style="text-align:center">
+      <h1>{{ .Data.Heading }}</h1>
+      <p class="muted">{{ .Data.Message }}</p>
+      <p style="margin-top:20px"><a class="btn" href="{{ .Data.BackTo }}">{{ .Data.BackLabel }}</a></p>
+      {{ with .Data.RequestID }}<p class="hint">Reference: <code>{{ . }}</code></p>{{ end }}
+    </div>
+  </section>
+</div>
+{{ end }}

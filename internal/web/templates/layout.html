@@ -1,0 +1,52 @@
+{{- /*
+  The single page frame. Every template is parsed together with this one, so
+  a page defines "title", "main" and optionally "nav", and never repeats the
+  document skeleton.
+*/ -}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ if .Title }}{{ .Title }} · socialstats{{ else }}socialstats{{ end }}</title>
+  <meta name="color-scheme" content="light dark">
+  {{- /* The dashboard is private to the signed-in account; keep it out of indexes. */}}
+  <meta name="robots" content="noindex, nofollow">
+  <link rel="stylesheet" href="{{ asset "app.css" }}">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231f5c9e'/><path d='M8 21l5-7 4 4 7-9' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span> socialstats</a>
+      {{ if .User }}
+      <nav aria-label="Main">
+        <a href="/"{{ if eq .Nav "dashboard" }} aria-current="page"{{ end }}>Dashboard</a>
+        <a href="/settings"{{ if eq .Nav "settings" }} aria-current="page"{{ end }}>Settings</a>
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+          <button type="submit" class="btn btn-quiet btn-sm">Sign out</button>
+        </form>
+      </nav>
+      {{ end }}
+    </div>
+  </header>
+
+  <div class="shell">
+    {{ with .Flash }}
+      <div class="flash flash-{{ .Level }}" role="status">{{ .Message }}</div>
+    {{ end }}
+
+    <main>
+      {{ block "main" . }}{{ end }}
+    </main>
+
+    <footer class="foot">
+      <span>socialstats {{ .Version }}</span>
+      <span>Counters are read from each platform on a schedule; a missing figure means the platform did not report one.</span>
+    </footer>
+  </div>
+
+  <script src="{{ asset "app.js" }}" defer></script>
+</body>
+</html>

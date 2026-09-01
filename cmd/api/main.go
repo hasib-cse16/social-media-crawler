@@ -26,6 +26,7 @@ import (
 	"github.com/foodibd/socialstats/internal/stats"
 	"github.com/foodibd/socialstats/internal/storage/postgres"
 	"github.com/foodibd/socialstats/internal/tracking"
+	"github.com/foodibd/socialstats/internal/web"
 )
 
 // version is stamped at build time: -ldflags "-X main.version=$(git rev-parse --short HEAD)".
@@ -138,7 +139,7 @@ func run() error {
 	tiktokClient := httpclient.NewWithoutConnectionReuse(cfg.UpstreamTimeout)
 	providers = append(providers, tiktok.New(cfg.TikTok, tiktokClient, log))
 
-	authSvc, authMW, err := buildAuth(cfg, db, log)
+	authSvc, err := buildAuth(cfg, db, log)
 	if err != nil {
 		return err
 	}
@@ -180,6 +181,23 @@ func run() error {
 		log.Info("polling disabled", "reason", "POLL_ENABLED=false")
 	}
 
+	// The dashboard and the middleware are mutually dependent: the middleware
+	// reports failures, and how a failure should look depends on whether the
+	// caller is a browser. The knot is untied here, at the composition root,
+	// rather than by either package importing the other.
+	webServer, err := web.New(trackingSvc, authSvc, web.Config{
+		Version:           version,
+		SecureCookies:     cfg.Auth.CookieSecure,
+		RegistrationOpen:  cfg.Auth.RegistrationOpen,
+		TrustProxyHeaders: cfg.Auth.TrustProxyHeaders,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("dashboard: %w", err)
+	}
+
+	authMW := auth.NewMiddleware(authSvc,
+		webServer.ErrorResponder(api.RespondError), cfg.Auth.TrustProxyHeaders)
+
 	apiHandler := api.NewHandler(service, log, version, db)
 	if poll != nil {
 		apiHandler = apiHandler.WithPoller(poll.Reporter())
@@ -194,6 +212,7 @@ func run() error {
 			Auth:           api.NewAuthHandler(authSvc, authMW),
 			Middleware:     authMW,
 			Tracking:       api.NewTrackingHandler(trackingSvc),
+			Web:            webServer,
 		},
 	)
 
@@ -212,7 +231,7 @@ func run() error {
 }
 
 // buildAuth assembles the authentication stack.
-func buildAuth(cfg *config.Config, db *postgres.DB, log *slog.Logger) (*auth.Service, *auth.Middleware, error) {
+func buildAuth(cfg *config.Config, db *postgres.DB, log *slog.Logger) (*auth.Service, error) {
 	hasher := auth.NewHasher(auth.HashParams{
 		Time:       cfg.Auth.HashTime,
 		Memory:     cfg.Auth.HashMemoryKiB,
@@ -238,7 +257,7 @@ func buildAuth(cfg *config.Config, db *postgres.DB, log *slog.Logger) (*auth.Ser
 			},
 		}, log)
 	if err != nil {
-		return nil, nil, fmt.Errorf("auth: %w", err)
+		return nil, fmt.Errorf("auth: %w", err)
 	}
 
 	// Worth stating at startup: password hashing is deliberately expensive, and
@@ -256,7 +275,7 @@ func buildAuth(cfg *config.Config, db *postgres.DB, log *slog.Logger) (*auth.Ser
 			"env", cfg.Env)
 	}
 
-	return svc, auth.NewMiddleware(svc, api.RespondError, cfg.Auth.TrustProxyHeaders), nil
+	return svc, nil
 }
 
 // reapSessions deletes expired sessions and idle rate limit buckets.

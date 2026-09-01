@@ -1,0 +1,37 @@
+{{ define "main" }}
+<div class="auth">
+  <section class="panel">
+    <div class="panel-body">
+      <h1>Create an account</h1>
+      <p class="muted small" style="margin-bottom:20px">Track view counts across platforms in one place.</p>
+
+      <form method="post" action="/register">
+        <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+
+        <div class="field">
+          <label for="display_name">Name</label>
+          <input id="display_name" name="display_name" type="text" autocomplete="name"
+                 autofocus value="{{ .Data.DisplayName }}">
+        </div>
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" required autocomplete="username" value="{{ .Data.Email }}">
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" required autocomplete="new-password"
+                 minlength="12">
+          <p class="hint">
+            At least 12 characters. A few unrelated words beat a short password with symbols in it —
+            length is what actually costs an attacker something.
+          </p>
+        </div>
+
+        <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Create account</button>
+      </form>
+    </div>
+  </section>
+
+  <p class="auth-alt">Already have an account? <a href="/login">Sign in</a>.</p>
+</div>
+{{ end }}

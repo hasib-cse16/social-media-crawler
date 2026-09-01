@@ -22,6 +22,7 @@ import (
 type UserStore interface {
 	Create(ctx context.Context, in domain.NewUser) (*domain.User, error)
 	ByID(ctx context.Context, id int64) (*domain.User, error)
+	UpdateProfile(ctx context.Context, userID int64, displayName, timezone string) (*domain.User, error)
 	Credentials(ctx context.Context, email string) (*domain.Credentials, error)
 	UpdatePasswordHash(ctx context.Context, userID int64, hash string) error
 	TouchLastLogin(ctx context.Context, userID int64, at time.Time) error
@@ -464,4 +465,21 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// UpdateProfile changes the fields a user controls about themselves.
+//
+// It lives here rather than being called on the repository directly so that
+// every write to an account goes through one place, which is where an audit
+// trail or a validation rule would be added without hunting for callers.
+func (s *Service) UpdateProfile(ctx context.Context, userID int64, displayName, timezone string) (*domain.User, error) {
+	if tz := strings.TrimSpace(timezone); tz != "" {
+		// A zone the standard library cannot load would render as a blank or a
+		// wrong time on every page, so it is rejected at the point of entry
+		// rather than discovered later.
+		if _, err := time.LoadLocation(tz); err != nil {
+			return nil, fmt.Errorf("%w: %q is not a known time zone", domain.ErrInvalidURL, tz)
+		}
+	}
+	return s.users.UpdateProfile(ctx, userID, displayName, timezone)
 }
