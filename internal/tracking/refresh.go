@@ -58,7 +58,7 @@ func (p RefreshPolicy) Outcome(
 	}
 
 	if fetchErr == nil && stats != nil {
-		next := startedAt.Add(p.Interval)
+		next := startedAt.Add(p.intervalFor(video))
 		out.Stats = stats
 		out.Status = domain.FetchOK
 		out.AttemptStatus = domain.AttemptOK
@@ -117,20 +117,33 @@ func (p RefreshPolicy) Outcome(
 		out.AttemptStatus = domain.AttemptError
 	}
 
-	next := startedAt.Add(p.backoff(failures))
+	next := startedAt.Add(p.backoff(video, failures))
 	out.NextFetchAt = &next
 	return out
+}
+
+// intervalFor prefers the video's own configured rate.
+//
+// The column is authoritative because the fetch is shared: one video is fetched
+// once however many people track it, so the rate has to live on the video
+// rather than on whichever poller happened to pick it up. The policy's own
+// interval is the fallback for a video that has never had one set.
+func (p RefreshPolicy) intervalFor(video *domain.Video) time.Duration {
+	if video != nil && video.Schedule.Interval > 0 {
+		return video.Schedule.Interval
+	}
+	if p.Interval > 0 {
+		return p.Interval
+	}
+	return DefaultPolicy.Interval
 }
 
 // backoff grows exponentially and is capped.
 //
 // Jitter is applied by the caller rather than here, so that Outcome stays a
 // pure function of its inputs and can be tested without a source of randomness.
-func (p RefreshPolicy) backoff(failures int) time.Duration {
-	interval := p.Interval
-	if interval <= 0 {
-		interval = DefaultPolicy.Interval
-	}
+func (p RefreshPolicy) backoff(video *domain.Video, failures int) time.Duration {
+	interval := p.intervalFor(video)
 	maxBackoff := p.MaxBackoff
 	if maxBackoff <= 0 {
 		maxBackoff = DefaultPolicy.MaxBackoff

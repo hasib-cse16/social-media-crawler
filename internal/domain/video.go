@@ -104,6 +104,15 @@ type NewVideo struct {
 	Platform        Platform
 	PlatformVideoID string
 	CanonicalURL    string
+
+	// FetchInterval sets how often this video should be refreshed, and applies
+	// only when the row is created. Platforms are polled at different rates —
+	// YouTube through a metered API, TikTok and Meta through pages that punish
+	// eagerness — so the rate is decided when the video first appears rather
+	// than being one number for everything.
+	//
+	// Zero leaves the column's default in place.
+	FetchInterval time.Duration
 }
 
 // TrackedVideo is one user's tracking of one video.

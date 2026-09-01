@@ -30,6 +30,7 @@ type Config struct {
 	Database DatabaseConfig
 	Auth     AuthConfig
 	Tracking TrackingConfig
+	Poll     PollConfig
 
 	YouTube YouTubeConfig
 	Meta    MetaConfig
@@ -114,6 +115,58 @@ type TrackingConfig struct {
 	// not-found can be a region block or a brief privacy toggle rather than a
 	// deleted video.
 	FailuresBeforeRetiring int
+}
+
+// PollConfig tunes the background refresh loop.
+type PollConfig struct {
+	// Enabled turns polling off, so a deployment can run web replicas that
+	// serve traffic and a single worker replica that polls.
+	Enabled bool
+
+	// Tick is how often the poller looks for work. It is not the refresh rate:
+	// each video's own interval decides when it is due, and this decides how
+	// promptly "due" gets noticed.
+	Tick time.Duration
+
+	// Batch is how many videos are claimed per platform per tick.
+	Batch int
+
+	// LockFor is how long a claim is held. It must exceed the slowest possible
+	// fetch, or a worker's video becomes claimable while it is still being
+	// worked on and gets fetched twice.
+	LockFor time.Duration
+
+	// RateLimitBackoff is how long a whole platform is held back after it says
+	// we are going too fast.
+	RateLimitBackoff time.Duration
+
+	// Platforms is the per-platform pacing.
+	Platforms map[Platform]PlatformPollConfig
+}
+
+// Platform names a supported platform in configuration. It mirrors
+// domain.Platform without importing it, so the config package stays a leaf.
+type Platform string
+
+const (
+	PlatformYouTube Platform = "youtube"
+	PlatformTikTok  Platform = "tiktok"
+	PlatformMeta    Platform = "meta"
+)
+
+// PlatformPollConfig is how hard one platform may be polled.
+//
+// Concurrency and MinInterval are different limits and both are needed:
+// concurrency bounds what is in flight, which protects us, while the minimum
+// gap bounds how closely requests follow one another, which is what the
+// platforms actually notice. A concurrency of 1 still hammers a fast endpoint.
+type PlatformPollConfig struct {
+	Concurrency int
+	MinInterval time.Duration
+
+	// Refresh is the interval given to videos on this platform when they are
+	// first tracked.
+	Refresh time.Duration
 }
 
 // DatabaseConfig describes the PostgreSQL connection. The dashboard stores
@@ -276,6 +329,38 @@ func Load() (*Config, error) {
 			MaxBackoff:             dur("TRACKING_MAX_BACKOFF", 24*time.Hour),
 			FailuresBeforeRetiring: intVal("TRACKING_FAILURES_BEFORE_RETIRING", 3),
 		},
+		Poll: PollConfig{
+			Enabled:          boolean("POLL_ENABLED", true),
+			Tick:             dur("POLL_TICK", time.Minute),
+			Batch:            intVal("POLL_BATCH", 50),
+			LockFor:          dur("POLL_LOCK_FOR", 5*time.Minute),
+			RateLimitBackoff: dur("POLL_RATE_LIMIT_BACKOFF", time.Hour),
+			Platforms: map[Platform]PlatformPollConfig{
+				// YouTube goes through a metered API, so the constraint is
+				// quota rather than goodwill and there is no reason to pause
+				// between calls.
+				PlatformYouTube: {
+					Concurrency: intVal("POLL_YOUTUBE_CONCURRENCY", 4),
+					MinInterval: dur("POLL_YOUTUBE_MIN_INTERVAL", 0),
+					Refresh:     dur("POLL_YOUTUBE_REFRESH", 6*time.Hour),
+				},
+				// TikTok challenges about a third of requests and punishes
+				// closely-spaced retries with a harder block, so it is polled
+				// gently and half as often.
+				PlatformTikTok: {
+					Concurrency: intVal("POLL_TIKTOK_CONCURRENCY", 2),
+					MinInterval: dur("POLL_TIKTOK_MIN_INTERVAL", 2*time.Second),
+					Refresh:     dur("POLL_TIKTOK_REFRESH", 12*time.Hour),
+				},
+				// Meta serves login walls rather than data for much of its
+				// catalogue; pushing harder does not change that.
+				PlatformMeta: {
+					Concurrency: intVal("POLL_META_CONCURRENCY", 2),
+					MinInterval: dur("POLL_META_MIN_INTERVAL", 2*time.Second),
+					Refresh:     dur("POLL_META_REFRESH", 12*time.Hour),
+				},
+			},
+		},
 		YouTube: YouTubeConfig{
 			APIKey:  str("YOUTUBE_API_KEY", ""),
 			BaseURL: str("YOUTUBE_API_BASE_URL", "https://www.googleapis.com/youtube/v3"),
@@ -353,6 +438,22 @@ func (c *Config) validate() error {
 	}
 	if c.Auth.HashThreads < 1 {
 		return fmt.Errorf("ARGON2_THREADS must be at least 1")
+	}
+	if c.Poll.Enabled {
+		for platform, policy := range c.Poll.Platforms {
+			if policy.Refresh <= 0 {
+				return fmt.Errorf("POLL_%s_REFRESH must be positive", strings.ToUpper(string(platform)))
+			}
+			// A claim that expires before the fetch finishes lets a second
+			// worker pick up a video that is still being fetched, which
+			// duplicates upstream requests — the precise thing polling is
+			// paced to avoid.
+			if c.Poll.LockFor <= c.UpstreamTimeout {
+				return fmt.Errorf("POLL_LOCK_FOR (%s) must exceed UPSTREAM_TIMEOUT (%s), "+
+					"or a slow fetch's video becomes claimable while it is still in flight",
+					c.Poll.LockFor, c.UpstreamTimeout)
+			}
+		}
 	}
 	return nil
 }

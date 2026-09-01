@@ -84,3 +84,13 @@ func errNoRowsAffected(what string, id any) error {
 func strconvSeconds(d time.Duration) string {
 	return strconv.FormatInt(int64(d/time.Second), 10)
 }
+
+// optionalIntervalArg renders a Duration as a Postgres interval literal, or nil
+// when it is unset so a column default applies.
+func optionalIntervalArg(d time.Duration) *string {
+	if d <= 0 {
+		return nil
+	}
+	s := strconvSeconds(d) + " seconds"
+	return &s
+}

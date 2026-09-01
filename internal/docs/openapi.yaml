@@ -777,6 +777,27 @@ components:
       properties:
         data: { $ref: '#/components/schemas/VideoStats' }
 
+    PlatformPolling:
+      type: object
+      required: [platform, polling, concurrency, refresh]
+      properties:
+        platform: { $ref: '#/components/schemas/Platform' }
+        polling:
+          type: boolean
+          description: |
+            False when the poller has taken this platform out of the rotation —
+            a missing credential, or a provider switched off. Videos on it are
+            not being refreshed.
+        reason: { type: string, description: Why polling stopped. }
+        backed_off:
+          type: boolean
+          description: True while the platform is waiting out a rate limit.
+        resumes_at: { type: string, format: date-time }
+        concurrency: { type: integer }
+        refresh:
+          type: string
+          description: The interval given to this platform's videos when first tracked.
+
     Health:
       type: object
       required: [status, version, platforms]
@@ -792,6 +813,18 @@ components:
           type: array
           description: Platforms registered in this deployment, in resolution order.
           items: { $ref: '#/components/schemas/Platform' }
+        polling:
+          type: array
+          description: |
+            Each platform's background-refresh state. Absent on a replica that
+            does not poll (`POLL_ENABLED=false`).
+
+            This lives in liveness rather than readiness deliberately: a replica
+            whose poller has disabled a platform can still serve requests
+            perfectly well and must not be pulled out of the load balancer — but
+            somebody needs to be able to see that videos are quietly not being
+            refreshed.
+          items: { $ref: '#/components/schemas/PlatformPolling' }
 
     TrackRequest:
       type: object
@@ -1505,6 +1538,16 @@ components:
                   status: ok
                   version: 1a2b3c4
                   platforms: [youtube, meta, tiktok]
+                  polling:
+                    - platform: youtube
+                      polling: true
+                      concurrency: 4
+                      refresh: 6h0m0s
+                    - platform: tiktok
+                      polling: false
+                      reason: 'provider is not configured: TIKTOK_ENABLED is false'
+                      concurrency: 2
+                      refresh: 12h0m0s
 
     BadRequest:
       description: The request was malformed, or the URL is not a supported video URL.

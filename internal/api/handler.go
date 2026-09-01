@@ -30,6 +30,15 @@ type Prober interface {
 	Ping(ctx context.Context) error
 }
 
+// PollReporter describes what the background refresher is doing.
+//
+// It is an interface returning `any` so this package does not import the poller
+// just to render its state — and so a deployment that runs no poller simply
+// supplies nothing.
+type PollReporter interface {
+	Status() any
+}
+
 // Handler holds the handler dependencies.
 type Handler struct {
 	svc     StatsService
@@ -39,10 +48,24 @@ type Handler struct {
 	// db is probed by /readyz. It is an interface rather than a concrete type
 	// so this package never imports the storage layer.
 	db Prober
+
+	// poll is optional: a deployment can run web replicas that do not poll.
+	poll PollReporter
 }
 
 func NewHandler(svc StatsService, log *slog.Logger, version string, db Prober) *Handler {
 	return &Handler{svc: svc, log: log, version: version, db: db}
+}
+
+// WithPoller attaches the background refresher so /healthz can report it.
+//
+// Polling state belongs in liveness rather than readiness: a replica whose
+// poller has disabled a platform is still perfectly able to serve requests, so
+// it must not be pulled out of the load balancer — but somebody does need to be
+// able to see that videos are quietly not being refreshed.
+func (h *Handler) WithPoller(poll PollReporter) *Handler {
+	h.poll = poll
+	return h
 }
 
 // statsResponse is the wire shape of a stats result.
@@ -119,11 +142,15 @@ func (h *Handler) respondStats(w http.ResponseWriter, r *http.Request, rawURL st
 // will recover on its own the moment the database comes back. Dependencies
 // belong in readiness, not liveness.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-	httpx.Data(w, r, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"status":    "ok",
 		"version":   h.version,
 		"platforms": h.svc.Platforms(),
-	})
+	}
+	if h.poll != nil {
+		body["polling"] = h.poll.Status()
+	}
+	httpx.Data(w, r, http.StatusOK, body)
 }
 
 // Ready handles GET /readyz: can this process serve traffic?

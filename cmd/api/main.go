@@ -18,6 +18,7 @@ import (
 	"github.com/foodibd/socialstats/internal/domain"
 	"github.com/foodibd/socialstats/internal/httpx"
 	"github.com/foodibd/socialstats/internal/platform/httpclient"
+	"github.com/foodibd/socialstats/internal/poller"
 	"github.com/foodibd/socialstats/internal/provider"
 	"github.com/foodibd/socialstats/internal/provider/meta"
 	"github.com/foodibd/socialstats/internal/provider/tiktok"
@@ -146,23 +147,46 @@ func run() error {
 	cache := stats.NewCache(cacheTTL())
 	service := stats.NewService(registry, cache, log)
 
+	refreshPolicy := tracking.RefreshPolicy{
+		Interval:               cfg.Tracking.RefreshInterval,
+		MaxBackoff:             cfg.Tracking.MaxBackoff,
+		FailuresBeforeRetiring: cfg.Tracking.FailuresBeforeRetiring,
+	}
+
 	trackingSvc := tracking.NewService(
 		db.Videos(), db.Tracking(), db.Metrics(), registry,
 		tracking.Config{
 			MaxTrackedPerUser: cfg.Tracking.MaxPerUser,
 			AddTimeout:        cfg.Tracking.AddTimeout,
-			Policy: tracking.RefreshPolicy{
-				Interval:               cfg.Tracking.RefreshInterval,
-				MaxBackoff:             cfg.Tracking.MaxBackoff,
-				FailuresBeforeRetiring: cfg.Tracking.FailuresBeforeRetiring,
-			},
+			Policy:            refreshPolicy,
+			// The per-platform refresh rate is set when a video is first
+			// tracked, and the poller reads it back off the row. One source of
+			// truth, on the video, because the fetch is shared.
+			PlatformIntervals: refreshIntervals(cfg),
 		}, log)
 
 	go reapCache(ctx, cache, log)
 	go reapSessions(ctx, authSvc, db, log)
 
+	var poll *poller.Poller
+	if cfg.Poll.Enabled {
+		poll = poller.New(db.Videos(), registry, pollerConfig(cfg, refreshPolicy), log)
+		go func() {
+			if err := poll.Run(ctx); err != nil {
+				log.Error("poller stopped", "error", err)
+			}
+		}()
+	} else {
+		log.Info("polling disabled", "reason", "POLL_ENABLED=false")
+	}
+
+	apiHandler := api.NewHandler(service, log, version, db)
+	if poll != nil {
+		apiHandler = apiHandler.WithPoller(poll.Reporter())
+	}
+
 	handler := api.NewRouter(
-		api.NewHandler(service, log, version, db),
+		apiHandler,
 		log,
 		api.RouterConfig{
 			HandlerTimeout: handlerTimeout(cfg),
@@ -258,6 +282,38 @@ func reapSessions(ctx context.Context, svc *auth.Service, db *postgres.DB, log *
 			}
 		}
 	}
+}
+
+// pollerConfig translates the environment-shaped config into the poller's own.
+func pollerConfig(cfg *config.Config, policy tracking.RefreshPolicy) poller.Config {
+	platforms := make(map[domain.Platform]poller.PlatformPolicy, len(cfg.Poll.Platforms))
+	for platform, p := range cfg.Poll.Platforms {
+		platforms[domain.Platform(platform)] = poller.PlatformPolicy{
+			Concurrency: p.Concurrency,
+			MinInterval: p.MinInterval,
+			Refresh:     p.Refresh,
+		}
+	}
+
+	return poller.Config{
+		Tick:             cfg.Poll.Tick,
+		Batch:            cfg.Poll.Batch,
+		LockFor:          cfg.Poll.LockFor,
+		RateLimitBackoff: cfg.Poll.RateLimitBackoff,
+		ShutdownGrace:    cfg.ShutdownTimeout,
+		Policy:           policy,
+		Platforms:        platforms,
+	}
+}
+
+// refreshIntervals is the rate each platform's videos are given when first
+// tracked.
+func refreshIntervals(cfg *config.Config) map[domain.Platform]time.Duration {
+	out := make(map[domain.Platform]time.Duration, len(cfg.Poll.Platforms))
+	for platform, p := range cfg.Poll.Platforms {
+		out[domain.Platform(platform)] = p.Refresh
+	}
+	return out
 }
 
 // handlerTimeout must cover the slowest provider. The scraping providers retry

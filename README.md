@@ -69,7 +69,7 @@ which is why responses are cached.
 | POST   | `/v1/auth/logout-all` | ends every session for the account      |
 | POST   | `/v1/auth/password` | change password; revokes every session    |
 | GET    | `/v1/auth/me`       | the signed-in account                     |
-| GET    | `/healthz`    | liveness + registered platforms           |
+| GET    | `/healthz`    | liveness + registered platforms + polling state |
 | GET    | `/readyz`     | readiness — 503 when the database is unreachable |
 | GET    | `/docs`       | Swagger UI                                |
 | GET    | `/openapi.yaml` | OpenAPI 3.1 specification               |
@@ -211,6 +211,50 @@ Details worth knowing:
 - **Freshness is judged per video.** A six-hourly YouTube video and a
   twelve-hourly TikTok video go stale at different speeds, so `fresh` compares
   against each video's own interval rather than one cutoff.
+
+## The poller
+
+Tracked videos are refreshed in the background, and the history that
+accumulates is what makes this a dashboard rather than a bookmark list.
+
+**Postgres is the queue.** The claim uses `FOR UPDATE SKIP LOCKED`, so any
+number of replicas divide the work between them with no leader election and no
+chance of two fetching the same video. A worker that dies mid-fetch is covered
+by the claim expiring — there is no liveness tracking of workers anywhere.
+
+**Two pacing limits per platform, because they do different jobs.** Concurrency
+bounds what is in flight, which protects us; the minimum gap bounds how closely
+requests follow one another, which is what the platforms actually notice. A
+concurrency of 1 still hammers a fast endpoint.
+
+| Platform  | Concurrency | Min gap | Refresh | Why |
+|-----------|-------------|---------|---------|-----|
+| YouTube   | 4 | none | 6 h  | Metered API; the constraint is quota, not goodwill |
+| TikTok    | 2 | 2 s  | 12 h | Challenges ~⅓ of requests; fast retries earn a harder block |
+| Meta      | 2 | 2 s  | 12 h | Login walls for much of the catalogue; pushing changes nothing |
+
+**Failures are told apart, because the right response differs:**
+
+| Result | What happens |
+|--------|--------------|
+| `ErrNotFound` ×3 in a row | Retired: polling stops, every snapshot is kept, the dashboard greys it out. Three, not one — a single not-found can be a region block or a brief privacy toggle. |
+| `ErrBlocked` | Backs off. **Never** retires. A login wall is our problem, not evidence the video is gone; conflating them would quietly delete people's videos during a bad afternoon. |
+| `ErrRateLimited` | Backs off the **whole platform** for an hour. The limit belongs to the platform, not to the video that happened to hit it. |
+| `ErrMisconfigured` | Disables that platform for the life of the process, logged once. A missing API key will not fix itself, and retrying it hundreds of times an hour fills the logs and the audit table with the same answer. |
+
+Backoff is exponential to a 24 h cap with **±20% jitter**. Without jitter,
+everything that failed during an outage retries in the same second when the
+outage ends — the fleet synchronises itself into the thundering herd the
+backoff was meant to avoid.
+
+`GET /healthz` reports each platform's polling state, including a disabled or
+backed-off one. It stays in liveness rather than readiness on purpose: a replica
+whose poller has given up on a platform can still serve requests perfectly well,
+so it must not be pulled out of the load balancer — but somebody does need to be
+able to see that videos are quietly not being refreshed.
+
+Set `POLL_ENABLED=false` to run web replicas that serve traffic and one worker
+replica that polls.
 
 ## Swagger / OpenAPI
 
@@ -371,6 +415,7 @@ internal/
   httpx/                  server lifecycle, middleware, JSON envelopes
   auth/                   argon2id, sessions, CSRF, login rate limiting
   tracking/               per-user video lists, growth, refresh policy
+  poller/                 claim loop, per-platform pacing, backoff
   storage/postgres/       pool, migrations, repositories (users, sessions,
                           videos, tracking, metrics, rate limits)
   provider/               registry that resolves a URL to its provider
@@ -434,9 +479,10 @@ make db-reset # destroy the dev database and rebuild from migrations
 make db-shell # psql against the dev database
 ```
 
-The schema, accounts and the full tracking API are in place. The background
-poller and the dashboard UI follow; see `docs/dashboard-design.md` for the plan
-and the reasoning.
+The schema, accounts, the tracking API and the background poller are in place,
+so history accumulates on its own. Retention and rollups, YouTube batching and
+the dashboard UI follow; see `docs/dashboard-design.md` for the plan and the
+reasoning.
 
 Repository tests run against a real PostgreSQL rather than a mock, because
 most of what the storage layer relies on — advisory locks, transactional DDL,

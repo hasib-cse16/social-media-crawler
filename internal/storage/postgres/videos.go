@@ -140,14 +140,19 @@ func (r *VideoRepo) Upsert(ctx context.Context, in domain.NewVideo) (*domain.Vid
 	// RETURNING rather than a data-modifying CTE followed by a SELECT: the
 	// outer query of such a CTE reads the snapshot taken before the insert, so
 	// it would not see the row that was just written.
+	//
+	// fetch_interval is set on insert only. On conflict it is deliberately left
+	// alone: the video already has a rate, possibly one an operator tuned, and
+	// the second person to track it should not silently reset that.
 	q := `
-		INSERT INTO videos (platform, platform_video_id, canonical_url)
-		VALUES ($1, $2, $3)
+		INSERT INTO videos (platform, platform_video_id, canonical_url, fetch_interval)
+		VALUES ($1, $2, $3, coalesce($4::interval, interval '6 hours'))
 		ON CONFLICT (platform, platform_video_id) DO UPDATE
 		SET canonical_url = excluded.canonical_url
 		RETURNING ` + videoReturning
 
-	return scanVideo(r.db.Pool.QueryRow(ctx, q, in.Platform, in.PlatformVideoID, in.CanonicalURL))
+	return scanVideo(r.db.Pool.QueryRow(ctx, q,
+		in.Platform, in.PlatformVideoID, in.CanonicalURL, optionalIntervalArg(in.FetchInterval)))
 }
 
 // ByID looks a video up by internal id.
@@ -458,4 +463,27 @@ func truncateDetail(s string) string {
 		return s
 	}
 	return s[:limit] + "..."
+}
+
+// SetFetchInterval changes how often a video is refreshed, and moves its next
+// fetch to match so a shortened interval takes effect now rather than after the
+// old one elapses.
+func (r *VideoRepo) SetFetchInterval(ctx context.Context, videoID int64, interval time.Duration) error {
+	const q = `
+		UPDATE videos
+		SET fetch_interval = $2::interval,
+		    next_fetch_at  = CASE
+		        WHEN next_fetch_at IS NULL THEN NULL
+		        ELSE least(next_fetch_at, coalesce(last_fetch_at, now()) + $2::interval)
+		    END
+		WHERE id = $1`
+
+	tag, err := r.db.Pool.Exec(ctx, q, videoID, intervalArg(interval))
+	if err != nil {
+		return translate(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errNoRowsAffected("video", videoID)
+	}
+	return nil
 }

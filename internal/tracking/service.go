@@ -65,6 +65,12 @@ type Config struct {
 
 	// AddTimeout bounds the synchronous fetch performed when a video is added.
 	AddTimeout time.Duration
+
+	// PlatformIntervals is the refresh rate each platform's videos get when
+	// first tracked. It is applied at creation and then lives on the row: the
+	// fetch is shared, so the rate has to belong to the video rather than to
+	// whichever component last looked at it.
+	PlatformIntervals map[domain.Platform]time.Duration
 }
 
 // Service is the tracking application layer.
@@ -185,6 +191,7 @@ func (s *Service) Add(ctx context.Context, userID int64, rawURL, label string) (
 		Platform:        ref.Platform,
 		PlatformVideoID: ref.VideoID,
 		CanonicalURL:    firstNonEmpty(ref.CanonicalURL, rawURL),
+		FetchInterval:   s.cfg.PlatformIntervals[ref.Platform],
 	})
 	if err != nil {
 		return nil, err
