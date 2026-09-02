@@ -1,0 +1,17 @@
+{{- /* One row of the lookup history. */ -}}
+{{ define "lookup_row" }}
+<tr>
+  <td class="video-cell">
+    <a href="/lookups/{{ .ID }}">{{ .Title }}</a>
+    {{ with .Caption }}<div class="video-caption">{{ . }}</div>{{ end }}
+  </td>
+  <td><span class="pill pill-{{ lower (printf "%s" .Platform) }}">{{ .PlatformName }}</span></td>
+  <td class="num" title="{{ .ViewsExact }} views">{{ .Views }}</td>
+  <td class="num">{{ .Likes }}</td>
+  <td class="num">{{ .Comments }}</td>
+  <td>
+    {{ with .ChannelEmail }}<a href="mailto:{{ . }}">{{ . }}</a>{{ else }}<span class="muted">—</span>{{ end }}
+  </td>
+  <td title="{{ timestamp .WhenAt }}">{{ .When }}</td>
+</tr>
+{{ end }}

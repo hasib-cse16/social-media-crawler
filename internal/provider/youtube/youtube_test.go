@@ -25,17 +25,31 @@ func newTestProvider(t *testing.T, handler http.HandlerFunc) (*Provider, *httpte
 }
 
 func TestStatsSuccess(t *testing.T) {
+	// A lookup is two calls — videos.list then channels.list — so the stub
+	// routes on the path rather than answering everything the same way.
 	p, _ := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("id"); got != "dQw4w9WgXcQ" {
-			t.Errorf("id param = %q", got)
-		}
 		if got := r.URL.Query().Get("key"); got != "test-key" {
 			t.Errorf("key param = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"items":[{"id":"dQw4w9WgXcQ",
-			"snippet":{"title":"Never Gonna Give You Up","channelId":"UC38","channelTitle":"Rick","publishedAt":"2009-10-25T06:57:33Z"},
-			"statistics":{"viewCount":"1500000000","likeCount":"18000000","commentCount":"2200000"}}]}`))
+
+		switch r.URL.Path {
+		case "/videos":
+			if got := r.URL.Query().Get("id"); got != "dQw4w9WgXcQ" {
+				t.Errorf("videos id param = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"items":[{"id":"dQw4w9WgXcQ",
+				"snippet":{"title":"Never Gonna Give You Up","channelId":"UC38","channelTitle":"Rick","publishedAt":"2009-10-25T06:57:33Z"},
+				"statistics":{"viewCount":"1500000000","likeCount":"18000000","commentCount":"2200000"}}]}`))
+		case "/channels":
+			if got := r.URL.Query().Get("id"); got != "UC38" {
+				t.Errorf("channels id param = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"items":[{"id":"UC38",
+				"snippet":{"title":"Rick Astley","customUrl":"@RickAstleyYT","description":"Bookings: management@example.com"}}]}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
 	})
 
 	got, err := p.Stats(context.Background(), "https://youtu.be/dQw4w9WgXcQ")
@@ -53,6 +67,46 @@ func TestStatsSuccess(t *testing.T) {
 	}
 	if got.PublishedAt == nil {
 		t.Error("PublishedAt = nil, want parsed timestamp")
+	}
+	if got.ChannelEmail != "management@example.com" {
+		t.Errorf("ChannelEmail = %q, want it read out of the channel description", got.ChannelEmail)
+	}
+	if got.ChannelURL != "https://www.youtube.com/@RickAstleyYT" {
+		t.Errorf("ChannelURL = %q", got.ChannelURL)
+	}
+	// channels.list carries the fuller name, so it wins over the video's copy.
+	if got.ChannelTitle != "Rick Astley" {
+		t.Errorf("ChannelTitle = %q", got.ChannelTitle)
+	}
+}
+
+// The view count is what the user asked for; a channels.list that fails must
+// not take the whole lookup down with it.
+func TestChannelFailureDoesNotFailTheLookup(t *testing.T) {
+	p, _ := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/channels" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[{"id":"dQw4w9WgXcQ",
+			"snippet":{"title":"A video","channelId":"UC38","channelTitle":"Rick"},
+			"statistics":{"viewCount":"42"}}]}`))
+	})
+
+	got, err := p.Stats(context.Background(), "https://youtu.be/dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if got.ViewCount == nil || *got.ViewCount != 42 {
+		t.Errorf("ViewCount = %v, want the count despite the channel call failing", got.ViewCount)
+	}
+	if got.ChannelEmail != "" {
+		t.Errorf("ChannelEmail = %q, want empty", got.ChannelEmail)
+	}
+	// The video's own channelTitle survives as the fallback.
+	if got.ChannelTitle != "Rick" {
+		t.Errorf("ChannelTitle = %q", got.ChannelTitle)
 	}
 }
 

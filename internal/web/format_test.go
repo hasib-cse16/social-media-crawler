@@ -61,29 +61,6 @@ func TestComma(t *testing.T) {
 
 // Negative growth is a real measurement — platforms revise view counts down —
 // so it has to render as one rather than being hidden or clamped.
-func TestSigned(t *testing.T) {
-	up, down, flat := int64(1_200), int64(-50_000), int64(0)
-
-	tests := []struct {
-		in        *int64
-		want      string
-		wantClass string
-	}{
-		{nil, "—", "delta-none"},
-		{&up, "+1,200", "delta-up"},
-		{&down, "-50,000", "delta-down"},
-		{&flat, "0", "delta-flat"},
-	}
-	for _, tc := range tests {
-		if got := signed(tc.in); got != tc.want {
-			t.Errorf("signed(%v) = %q, want %q", tc.in, got, tc.want)
-		}
-		if got := deltaClass(tc.in); got != tc.wantClass {
-			t.Errorf("deltaClass(%v) = %q, want %q", tc.in, got, tc.wantClass)
-		}
-	}
-}
-
 func TestAgo(t *testing.T) {
 	now := time.Now()
 	tests := []struct {
@@ -105,58 +82,21 @@ func TestAgo(t *testing.T) {
 	}
 }
 
-func TestDuration(t *testing.T) {
-	tests := map[time.Duration]string{
-		0: "—", 45 * time.Second: "45 seconds", 5 * time.Minute: "5 minutes",
-		time.Hour: "1 hour", 6 * time.Hour: "6 hours",
-		24 * time.Hour: "1 day", 48 * time.Hour: "2 days",
-	}
-	for in, want := range tests {
-		if got := duration(in); got != want {
-			t.Errorf("duration(%v) = %q, want %q", in, got, want)
-		}
-	}
-}
+// A row must never be blank when a platform reports no title.
+func TestLookupTitleFallsBack(t *testing.T) {
+	l := domain.Lookup{VideoID: "abc123", Title: "A caption", ChannelTitle: "A channel"}
 
-// "Blocked" and "removed" look similar in a table and mean opposite things —
-// one is our problem and will clear, the other is the video actually gone.
-func TestStatusDistinguishesBlockedFromGone(t *testing.T) {
-	now := time.Now()
-
-	blocked := &domain.Video{Schedule: domain.FetchSchedule{LastFetchStatus: domain.FetchBlocked}}
-	gone := &domain.Video{Schedule: domain.FetchSchedule{
-		LastFetchStatus: domain.FetchNotFound, UnavailableSince: &now,
-	}}
-
-	if statusLabel(blocked) == statusLabel(gone) {
-		t.Fatal("a blocked video and a removed one read the same")
-	}
-	if !strings.Contains(statusLabel(blocked), "retry") {
-		t.Errorf("blocked reads %q; it should say it will be retried", statusLabel(blocked))
-	}
-	if statusTone(blocked) != "warning" || statusTone(gone) != "critical" {
-		t.Errorf("tones: blocked=%q gone=%q", statusTone(blocked), statusTone(gone))
+	if got := lookupTitle(l); got != "A caption" {
+		t.Errorf("with a title = %q", got)
 	}
 
-	ok := &domain.Video{Schedule: domain.FetchSchedule{LastFetchStatus: domain.FetchOK}}
-	if statusTone(ok) != "ok" {
-		t.Errorf("healthy tone = %q", statusTone(ok))
-	}
-}
-
-// A row must never be blank while a fetch is pending.
-func TestVideoTitleFallsBack(t *testing.T) {
-	v := &domain.Video{PlatformVideoID: "abc123", Title: "A caption", ChannelTitle: "A channel"}
-
-	if got := videoTitle(v, "My label"); got != "My label" {
-		t.Errorf("with a label = %q", got)
-	}
-	if got := videoTitle(v, ""); got != "A caption" {
-		t.Errorf("without a label = %q", got)
+	noTitle := domain.Lookup{VideoID: "abc123", ChannelTitle: "A channel"}
+	if got := lookupTitle(noTitle); got != "A channel — abc123" {
+		t.Errorf("with only a channel = %q", got)
 	}
 
-	bare := &domain.Video{PlatformVideoID: "abc123"}
-	if got := videoTitle(bare, ""); got != "abc123" {
+	bare := domain.Lookup{VideoID: "abc123"}
+	if got := lookupTitle(bare); got != "abc123" {
 		t.Errorf("with no metadata = %q, want the id", got)
 	}
 }

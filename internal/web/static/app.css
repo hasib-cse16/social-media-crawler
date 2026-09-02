@@ -250,23 +250,6 @@ tbody tr:hover { background: var(--surface-sunk); }
 .delta-down { color: var(--critical); }
 .delta-flat, .delta-none { color: var(--muted); }
 
-/* ---------- charts ---------- */
-
-.sparkline { width: 120px; height: 32px; display: block; }
-.spark-line { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
-.spark-area { fill: color-mix(in srgb, var(--accent) 12%, transparent); stroke: none; }
-.spark-end { fill: var(--accent); }
-.sparkline-empty line { stroke: var(--rule-strong); stroke-width: 1.5; stroke-dasharray: 3 3; }
-
-.chart { width: 100%; height: auto; display: block; }
-.chart .grid { stroke: var(--rule); stroke-width: 1; }
-.chart .axis { fill: var(--muted); font-size: 11px; font-family: var(--sans); }
-.chart-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.chart-area { fill: color-mix(in srgb, var(--accent) 10%, transparent); stroke: none; }
-.chart-dot { fill: var(--surface); stroke: var(--accent); stroke-width: 1.5; }
-.chart-end { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
-.chart-empty { padding: 48px 20px; text-align: center; color: var(--ink-soft); }
-
 /* ---------- forms ---------- */
 
 .field { margin-bottom: 14px; }
@@ -386,3 +369,11 @@ textarea { min-height: 72px; resize: vertical; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---------- lookup detail ---------- */
+dl.detail { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; }
+dl.detail dt { color: var(--muted); font-size: 13px; }
+dl.detail dd { margin: 0; }
+.channel-about { white-space: pre-wrap; color: var(--ink-soft); max-height: 20em; overflow-y: auto; }
+.muted { color: var(--muted); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }

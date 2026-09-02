@@ -53,7 +53,11 @@ servers:
 
 tags:
   - name: stats
-    description: Video metric lookups.
+    description: One-off video metric reads, with no account and no history.
+  - name: lookups
+    description: Looking a video URL up and reading back what this account looked up before.
+  - name: auth
+    description: Accounts and sessions.
   - name: system
     description: Liveness and readiness probes.
 
@@ -140,321 +144,93 @@ paths:
         '503': { $ref: '#/components/responses/ProviderUnavailable' }
         '504': { $ref: '#/components/responses/UpstreamTimeout' }
 
-  /v1/videos:
+  /v1/lookups:
     get:
-      tags: [tracking]
-      summary: The caller's tracked videos
+      tags: [lookups]
+      summary: The caller's lookup history
       description: |
-        Returns the caller's list with each video's current counters and its
-        growth over the requested window.
-
-        `views_gained` is the current view count minus the last reading at or
-        before the window's start. It is **absent rather than zero** when there
-        is no baseline — a video added yesterday has no week-old reading — and
-        it is **signed**, because platforms revise view counts downward and a
-        negative is a real measurement.
-      operationId: listVideos
+        Returns what this account has looked up, newest first. Each entry is the
+        reading taken at `looked_up_at` and is never revised — looking the same
+        URL up again appends a new entry rather than updating this one.
+      operationId: listLookups
       security:
         - sessionCookie: []
-        - bearerToken: []
-      parameters:
-        - name: window
-          in: query
-          description: How far back the growth baseline is taken from. Max one year.
-          schema: { type: string, default: 168h, examples: ['24h', '168h'] }
-        - name: platform
-          in: query
-          schema: { $ref: '#/components/schemas/Platform' }
-        - name: sort
-          in: query
-          schema:
-            type: string
-            enum: [views, gained, recent, title, fetched]
-            default: views
-        - name: sparkline
-          in: query
-          description: |
-            Attach this many recent readings to each entry, oldest first. Off by
-            default: it costs one query per video, which is fine for a page and
-            wasteful for a client that only wants the numbers.
-          schema: { type: integer, minimum: 0, maximum: 200, default: 0 }
-        - name: limit
-          in: query
-          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
-        - name: offset
-          in: query
-          schema: { type: integer, minimum: 0, default: 0 }
-        - $ref: '#/components/parameters/RequestID'
+        - bearerAuth: []
       responses:
         '200':
-          description: The caller's tracked videos.
+          description: The caller's lookups.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/VideoListEnvelope' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+              schema: { $ref: '#/components/schemas/LookupListEnvelope' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
     post:
-      tags: [tracking]
-      summary: Track a video
+      tags: [lookups]
+      summary: Look up a video URL
       description: |
-        Resolves the URL, records the video and starts tracking it for the
-        caller — then **fetches it immediately**, so the response carries real
-        numbers rather than an empty row that fills in within the next interval.
+        Fetches the video's public counters from its platform and records the
+        result. The fetch is synchronous, so this is the slowest endpoint here:
+        the scraping platforms retry, and the response waits for them.
 
-        A failed first fetch still tracks the video and still returns `201`. The
-        failure is recorded on the row (`schedule.last_fetch_status`) and in the
-        fetch log, and the poller retries: a TikTok challenge at 14:03 is not a
-        reason to refuse to track a video.
-
-        The exception is short links (`vm.tiktok.com`, `fb.watch`,
-        `/share/...`), which carry no id until the redirect is followed. A
-        failed fetch there means the video genuinely cannot be identified, and
-        the request fails rather than tracking something unknown.
-      operationId: trackVideo
+        For YouTube the channel is fetched too, which is where `channel_email`
+        comes from — owners publish a contact address in their channel
+        description, and it is read out of there. Absent means the owner did not
+        publish one, not that the lookup failed.
+      operationId: createLookup
       security:
         - sessionCookie: []
-        - bearerToken: []
+        - bearerAuth: []
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/TrackRequest' }
-          application/x-www-form-urlencoded:
-            schema: { $ref: '#/components/schemas/TrackRequest' }
+            schema: { $ref: '#/components/schemas/LookupRequest' }
       responses:
         '201':
-          description: |
-            Now tracked. Whether the first fetch succeeded is reported by the
-            entry's own fetch status, not by the status code.
+          description: The recorded lookup.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/EntryEnvelope' }
+              schema: { $ref: '#/components/schemas/LookupEnvelope' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/LimitReached' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
         '502': { $ref: '#/components/responses/UpstreamError' }
 
-  /v1/videos/{id}:
+  /v1/lookups/{id}:
     parameters:
-      - $ref: '#/components/parameters/VideoID'
+      - $ref: '#/components/parameters/LookupID'
     get:
-      tags: [tracking]
-      summary: One tracked video
-      operationId: getVideo
-      security:
-        - sessionCookie: []
-        - bearerToken: []
-      responses:
-        '200':
-          description: The tracked video.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/EntryEnvelope' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotTracked' }
-
-    patch:
-      tags: [tracking]
-      summary: Rename or annotate a tracked video
+      tags: [lookups]
+      summary: One past lookup
       description: |
-        Changes only the fields that are sent. Omitting `notes` leaves the
-        existing notes alone; sending `""` clears them.
-
-        Both are per-user: two accounts tracking the same video keep their own
-        label and notes.
-      operationId: updateTrackedVideo
+        Scoped to the caller. Another account's id answers 404 rather than 403,
+        so the endpoint cannot be used to discover that a lookup exists.
+      operationId: getLookup
       security:
         - sessionCookie: []
-        - bearerToken: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/UpdateTrackingRequest' }
+        - bearerAuth: []
       responses:
         '200':
-          description: Updated.
+          description: The lookup.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/EntryEnvelope' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+              schema: { $ref: '#/components/schemas/LookupEnvelope' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotTracked' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
     delete:
-      tags: [tracking]
-      summary: Stop tracking a video
-      description: |
-        Removes the video from the caller's list. The video and its entire
-        history survive: other accounts may be tracking it, and re-adding it
-        later restores both the collected history and the label.
-
-        Polling stops only when the last tracker leaves.
-      operationId: untrackVideo
+      tags: [lookups]
+      summary: Remove a lookup from the history
+      operationId: deleteLookup
       security:
         - sessionCookie: []
-        - bearerToken: []
+        - bearerAuth: []
       responses:
-        '200':
-          description: Untracked.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: object
-                    properties:
-                      untracked: { type: boolean }
-                      history_kept: { type: boolean }
+        '204': { description: Removed. }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotTracked' }
-
-  /v1/videos/{id}/history:
-    get:
-      tags: [tracking]
-      summary: A video's readings over time
-      description: |
-        Returns the time series for one video.
-
-        `source` says where the figures came from, because the two are not
-        equivalent: `snapshots` are individual measurements, `daily_rollup` rows
-        summarise days whose raw data has since been expired. A `day` bucket
-        reads the rollup when one exists and falls back to the raw series when
-        it does not, rather than returning an empty chart that looks like the
-        video has no history.
-
-        Bucketing takes the **last** reading in each bucket, not an average:
-        these are cumulative counters, and the mean of two of them is not a
-        number the video ever had.
-      operationId: getVideoHistory
-      security:
-        - sessionCookie: []
-        - bearerToken: []
-      parameters:
-        - $ref: '#/components/parameters/VideoID'
-        - name: from
-          in: query
-          description: RFC 3339. Defaults to seven days before `to`.
-          schema: { type: string, format: date-time }
-        - name: to
-          in: query
-          description: RFC 3339. Defaults to now.
-          schema: { type: string, format: date-time }
-        - name: bucket
-          in: query
-          schema: { type: string, enum: [raw, hour, day], default: raw }
-      responses:
-        '200':
-          description: The video's readings.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/HistoryEnvelope' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotTracked' }
-
-  /v1/videos/{id}/attempts:
-    get:
-      tags: [tracking]
-      summary: A video's recent fetch attempts
-      description: |
-        Every attempt to refresh this video, successful or not. This is how
-        "why is this number stale?" gets answered without reading logs.
-      operationId: getVideoAttempts
-      security:
-        - sessionCookie: []
-        - bearerToken: []
-      parameters:
-        - $ref: '#/components/parameters/VideoID'
-        - name: limit
-          in: query
-          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
-      responses:
-        '200':
-          description: Recent attempts, newest first.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/AttemptsEnvelope' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotTracked' }
-
-  /v1/videos/{id}/refresh:
-    post:
-      tags: [tracking]
-      summary: Bring the next fetch forward
-      description: |
-        Schedules the video to be fetched on the next poll tick, for a caller
-        who does not want to wait for the interval.
-
-        It returns `202` because it queues rather than fetches. Fetching inline
-        on demand would let one impatient account spend the whole deployment's
-        TikTok and Meta budget, and the poller is already what paces platform
-        access.
-      operationId: refreshVideo
-      security:
-        - sessionCookie: []
-        - bearerToken: []
-      parameters:
-        - $ref: '#/components/parameters/VideoID'
-      responses:
-        '202':
-          description: Queued for the next poll tick.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: object
-                    properties:
-                      queued: { type: boolean }
-                      video: { $ref: '#/components/schemas/Entry' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotTracked' }
-        '410':
-          description: |
-            The video has been retired: the platform said it no longer exists,
-            repeatedly. Its history is still readable; it is simply not fetched
-            any more.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Error' }
-
-  /v1/dashboard/summary:
-    get:
-      tags: [tracking]
-      summary: Headline figures for the caller
-      description: |
-        Totals, a per-platform breakdown, coverage, and the videos that moved
-        most over the window.
-
-        `stale` counts videos whose newest reading is older than twice their own
-        fetch interval — per video rather than one cutoff, because a six-hourly
-        YouTube video and a twelve-hourly TikTok video go stale at different
-        speeds and a single threshold would misreport one of them.
-      operationId: getDashboardSummary
-      security:
-        - sessionCookie: []
-        - bearerToken: []
-      parameters:
-        - name: window
-          in: query
-          schema: { type: string, default: 168h }
-        - name: movers
-          in: query
-          schema: { type: integer, minimum: 0, maximum: 50, default: 5 }
-      responses:
-        '200':
-          description: The caller's headline figures.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/SummaryEnvelope' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/auth/register:
     post:
@@ -668,13 +444,13 @@ components:
         one. Every form-encoded write is checked, including sign-in and sign-up.
 
   parameters:
-    VideoID:
+    LookupID:
       name: id
       in: path
       required: true
       description: |
-        The video's public uuid. Internal row ids are never exposed, so the ids
-        in these URLs cannot be enumerated.
+        The lookup's public uuid. Internal row ids are never exposed, so the
+        ids in these URLs cannot be enumerated.
       schema: { type: string, format: uuid }
     RequestID:
       name: X-Request-Id
@@ -793,27 +569,6 @@ components:
       properties:
         data: { $ref: '#/components/schemas/VideoStats' }
 
-    PlatformPolling:
-      type: object
-      required: [platform, polling, concurrency, refresh]
-      properties:
-        platform: { $ref: '#/components/schemas/Platform' }
-        polling:
-          type: boolean
-          description: |
-            False when the poller has taken this platform out of the rotation —
-            a missing credential, or a provider switched off. Videos on it are
-            not being refreshed.
-        reason: { type: string, description: Why polling stopped. }
-        backed_off:
-          type: boolean
-          description: True while the platform is waiting out a rate limit.
-        resumes_at: { type: string, format: date-time }
-        concurrency: { type: integer }
-        refresh:
-          type: string
-          description: The interval given to this platform's videos when first tracked.
-
     Health:
       type: object
       required: [status, version, platforms]
@@ -829,46 +584,20 @@ components:
           type: array
           description: Platforms registered in this deployment, in resolution order.
           items: { $ref: '#/components/schemas/Platform' }
-        polling:
-          type: array
-          description: |
-            Each platform's background-refresh state. Absent on a replica that
-            does not poll (`POLL_ENABLED=false`).
 
-            This lives in liveness rather than readiness deliberately: a replica
-            whose poller has disabled a platform can still serve requests
-            perfectly well and must not be pulled out of the load balancer — but
-            somebody needs to be able to see that videos are quietly not being
-            refreshed.
-          items: { $ref: '#/components/schemas/PlatformPolling' }
-
-    TrackRequest:
+    LookupRequest:
       type: object
       required: [url]
       properties:
         url:
           type: string
           format: uri
-          description: Any URL form the providers accept; see the /v1/stats parameter.
-          examples: ['https://www.tiktok.com/@user/video/7249376077976472833']
-        label:
-          type: string
-          description: The caller's own name for this video. Per-user, not shared.
-          examples: ['Q3 launch']
+          description: A video URL on any supported platform.
+          example: https://www.youtube.com/watch?v=dQw4w9WgXcQ
 
-    UpdateTrackingRequest:
+    Lookup:
       type: object
-      description: |
-        Only the fields present are changed. Omit one to leave it alone; send an
-        empty string to clear it.
-      properties:
-        label: { type: string }
-        notes: { type: string }
-      minProperties: 1
-
-    TrackedVideo:
-      type: object
-      required: [id, platform, video_id, canonical_url, latest, first_seen_at]
+      required: [id, platform, video_id, canonical_url, counters, looked_up_at]
       properties:
         id: { type: string, format: uuid }
         platform: { $ref: '#/components/schemas/Platform' }
@@ -877,15 +606,35 @@ components:
           description: The platform's own id. With `platform` it is the natural key.
         canonical_url: { type: string, format: uri }
         title: { type: string }
+        published_at: { type: string, format: date-time }
         channel_id: { type: string }
         channel_title: { type: string }
-        published_at: { type: string, format: date-time }
-        latest: { $ref: '#/components/schemas/Counters' }
-        latest_captured_at:
+        channel_url:
+          type: string
+          format: uri
+          description: A link to the channel or profile that posted the video.
+        channel_email:
+          type: string
+          format: email
+          description: |
+            The channel's public contact address, when the owner published one.
+
+            YouTube only, and read out of the channel description rather than
+            from a dedicated API field, because there is no such field. Absent
+            means the owner did not publish an address in a form we can read —
+            not that the lookup failed.
+        channel_description:
+          type: string
+          description: |
+            The channel's about-text. Kept because it is where `channel_email`
+            was read from, so a caller can check the extraction.
+        counters: { $ref: '#/components/schemas/Counters' }
+        looked_up_at:
           type: string
           format: date-time
-          description: When `latest` was measured. Absent if never fetched.
-        first_seen_at: { type: string, format: date-time }
+          description: |
+            When the platform reported these figures. The counters are never
+            revised afterwards — look the URL up again for current numbers.
 
     Counters:
       type: object
@@ -901,177 +650,24 @@ components:
         share_count: { type: integer, format: int64, minimum: 0 }
         save_count: { type: integer, format: int64, minimum: 0 }
 
-    Snapshot:
-      type: object
-      required: [captured_at]
-      description: One reading of a video's counters at a point in time.
-      allOf:
-        - $ref: '#/components/schemas/Counters'
-        - type: object
-          properties:
-            captured_at: { type: string, format: date-time }
-
-    DailyMetric:
-      type: object
-      required: [day, sample_count]
-      properties:
-        day: { type: string, format: date }
-        first_view_count: { type: integer, format: int64 }
-        last_view_count: { type: integer, format: int64 }
-        last_like_count: { type: integer, format: int64 }
-        last_comment_count: { type: integer, format: int64 }
-        last_share_count: { type: integer, format: int64 }
-        last_save_count: { type: integer, format: int64 }
-        view_delta:
-          type: integer
-          format: int64
-          description: |
-            Last minus first. **Signed**: platforms revise view counts downward,
-            so a negative here is a measurement, not corrupt data.
-        sample_count:
-          type: integer
-          description: |
-            How many raw readings this day summarises. A day with one sample has
-            a meaningless delta, and a chart should say so rather than drawing a
-            confident flat line across a gap in coverage.
-
-    Entry:
-      type: object
-      required: [video, added_at, fresh]
-      properties:
-        video: { $ref: '#/components/schemas/TrackedVideo' }
-        label: { type: string }
-        added_at: { type: string, format: date-time }
-        views_gained:
-          type: integer
-          format: int64
-          description: |
-            Current view count minus the baseline. Absent when there is no
-            baseline in the window, and signed, because counters are not
-            monotonic.
-        baseline_at:
-          type: string
-          format: date-time
-          description: |
-            When the reading `views_gained` was measured against was taken.
-            Without it the delta is uninterpretable: "+1,200 since some
-            unspecified point" is not a fact anyone can use.
-        sparkline:
-          type: array
-          description: Recent readings, oldest first. Only when `sparkline` was requested.
-          items: { $ref: '#/components/schemas/Snapshot' }
-        fresh:
-          type: boolean
-          description: |
-            Whether the latest reading is recent enough to show without a
-            caveat, measured against this video's own fetch interval rather than
-            a fixed cutoff.
-
-    EntryEnvelope:
+    LookupEnvelope:
       type: object
       required: [data]
       properties:
-        data: { $ref: '#/components/schemas/Entry' }
+        data: { $ref: '#/components/schemas/Lookup' }
 
-    VideoListEnvelope:
+    LookupListEnvelope:
       type: object
       required: [data]
       properties:
         data:
           type: object
-          required: [videos, count, window, limit, offset]
+          required: [lookups, count]
           properties:
-            videos:
+            lookups:
               type: array
-              items: { $ref: '#/components/schemas/Entry' }
+              items: { $ref: '#/components/schemas/Lookup' }
             count: { type: integer }
-            window: { type: string }
-            limit: { type: integer }
-            offset: { type: integer }
-
-    HistoryEnvelope:
-      type: object
-      required: [data]
-      properties:
-        data:
-          type: object
-          required: [video, from, to, bucket, source]
-          properties:
-            video: { $ref: '#/components/schemas/TrackedVideo' }
-            from: { type: string, format: date-time }
-            to: { type: string, format: date-time }
-            bucket: { type: string, enum: [raw, hour, day] }
-            source:
-              type: string
-              enum: [snapshots, daily_rollup]
-              description: |
-                Where the figures came from. Raw snapshots are individual
-                measurements; daily rollup rows summarise days whose raw data
-                has been expired. A chart drawn from one has different
-                properties from a chart drawn from the other.
-            snapshots:
-              type: array
-              items: { $ref: '#/components/schemas/Snapshot' }
-            daily:
-              type: array
-              items: { $ref: '#/components/schemas/DailyMetric' }
-
-    FetchAttempt:
-      type: object
-      required: [platform, started_at, duration_ms, status]
-      properties:
-        platform: { $ref: '#/components/schemas/Platform' }
-        started_at: { type: string, format: date-time }
-        duration_ms: { type: integer }
-        status:
-          type: string
-          enum: [ok, not_found, blocked, rate_limited, timeout, error]
-        error_code: { type: string }
-        error_detail: { type: string }
-
-    AttemptsEnvelope:
-      type: object
-      required: [data]
-      properties:
-        data:
-          type: object
-          required: [attempts]
-          properties:
-            attempts:
-              type: array
-              items: { $ref: '#/components/schemas/FetchAttempt' }
-
-    SummaryEnvelope:
-      type: object
-      required: [data]
-      properties:
-        data:
-          type: object
-          required: [tracked_videos, by_platform, total_views, views_gained, stale, unavailable, window]
-          properties:
-            tracked_videos: { type: integer }
-            by_platform:
-              type: object
-              additionalProperties: { type: integer }
-            total_views: { type: integer, format: int64 }
-            views_gained:
-              type: integer
-              format: int64
-              description: Summed across the caller's videos. Signed.
-            stale:
-              type: integer
-              description: |
-                Videos whose newest reading is older than twice their own fetch
-                interval.
-            unavailable:
-              type: integer
-              description: |
-                Videos retired because the platform said, repeatedly, that they
-                no longer exist. Their history is kept.
-            window: { type: string }
-            top_movers:
-              type: array
-              items: { $ref: '#/components/schemas/Entry' }
 
     RegisterRequest:
       type: object
@@ -1232,8 +828,6 @@ components:
         | `already_exists` | 409 | that email address already has an account |
         | `too_many_attempts` | 429 | too many failed sign-ins; see `Retry-After` |
         | `weak_password` | 400 | the password does not meet the minimum requirements |
-        | `limit_reached` | 422 | the account is at its tracking limit |
-        | `gone` | 410 | the video was retired; its history is still readable |
         | `unresolved_short_link` | 502 | a short link's redirect could not be followed |
         | `rate_limited` | 429 | upstream quota exhausted — retry later |
         | `internal_error` | 500 | unexpected server fault |
@@ -1500,46 +1094,6 @@ components:
                   message: that email address already has an account
                   request_id: 4578b3dfd96037e2db9a9a112cf0bdde
 
-    NotTracked:
-      description: |
-        No such video on the caller's list.
-
-        A video the caller does not track returns `404` rather than `403`, so
-        the endpoint does not confirm that a video other people are tracking
-        exists.
-      headers:
-        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
-          examples:
-            notTracked:
-              value:
-                error:
-                  code: not_found
-                  message: no such record
-                  request_id: 6f1c2a9d4e6b70318a5c2d9e7f4b1a63
-
-    LimitReached:
-      description: |
-        The account is at its tracking limit.
-
-        Tracking is what creates polling work, and polling work is spent against
-        upstream quota and anti-bot budgets that everyone on the deployment
-        shares — so one account cannot take all of it.
-      headers:
-        X-Request-Id: { $ref: '#/components/headers/XRequestID' }
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/Error' }
-          examples:
-            full:
-              value:
-                error:
-                  code: limit_reached
-                  message: 'account limit reached: you are tracking 200 videos, the limit is 200'
-                  request_id: 91a0bcde2f3147a5b8c6d2e9f0a1b234
-
     Health:
       description: The service is up.
       headers:
@@ -1554,16 +1108,6 @@ components:
                   status: ok
                   version: 1a2b3c4
                   platforms: [youtube, meta, tiktok]
-                  polling:
-                    - platform: youtube
-                      polling: true
-                      concurrency: 4
-                      refresh: 6h0m0s
-                    - platform: tiktok
-                      polling: false
-                      reason: 'provider is not configured: TIKTOK_ENABLED is false'
-                      concurrency: 2
-                      refresh: 12h0m0s
 
     BadRequest:
       description: The request was malformed, or the URL is not a supported video URL.
@@ -1596,7 +1140,11 @@ components:
                   request_id: add2d0a65dc565fa18585bb50d243bc3
 
     NotFound:
-      description: The video, or the endpoint, does not exist.
+      description: |
+        The video, the lookup, or the endpoint does not exist.
+
+        A lookup belonging to another account answers `404` rather than `403`,
+        so the endpoint does not confirm that someone else's lookup exists.
       headers:
         X-Request-Id: { $ref: '#/components/headers/XRequestID' }
       content:
@@ -1609,6 +1157,12 @@ components:
                   code: not_found
                   message: the video does not exist, is private, or was removed
                   request_id: 82386569467a5dad423f6d1f90278a05
+            lookup:
+              value:
+                error:
+                  code: not_found
+                  message: no such record
+                  request_id: 6f1c2a9d4e6b70318a5c2d9e7f4b1a63
 
     RateLimited:
       description: |

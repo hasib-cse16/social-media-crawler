@@ -48,15 +48,13 @@ func (s *Server) Routes(mux *http.ServeMux, mw *auth.Middleware) {
 	// "/{$}" anchors to exactly the root. A bare "GET /" would swallow every
 	// unmatched GET and turn a typo into the dashboard.
 	mux.Handle("GET /{$}", page(s.Dashboard))
-	mux.Handle("GET /videos/{id}", page(s.Video))
+	mux.Handle("GET /lookups/{id}", page(s.LookupDetail))
 	mux.Handle("GET /settings", page(s.Settings))
 
-	mux.Handle("POST /videos", action(s.AddVideo))
-	mux.Handle("POST /videos/{id}", action(s.UpdateVideo))
+	mux.Handle("POST /lookups", action(s.Lookup))
 	// A form post rather than DELETE, because HTML forms speak only GET and
 	// POST. The route says what it does instead of smuggling a method override.
-	mux.Handle("POST /videos/{id}/delete", action(s.RemoveVideo))
-	mux.Handle("POST /videos/{id}/refresh", action(s.RefreshVideo))
+	mux.Handle("POST /lookups/{id}/delete", action(s.RemoveLookup))
 	mux.Handle("POST /settings", action(s.SaveProfile))
 	mux.Handle("POST /settings/password", action(s.ChangePassword))
 	mux.Handle("POST /logout-all", action(s.LogoutEverywhere))

@@ -3,81 +3,17 @@ package web
 import (
 	"errors"
 	"net/http"
-	"strconv"
-	"time"
 
 	"github.com/foodibd/socialstats/internal/domain"
 	"github.com/foodibd/socialstats/internal/httpx"
-	"github.com/foodibd/socialstats/internal/storage/postgres"
-	"github.com/foodibd/socialstats/internal/tracking"
 )
 
-// Input validation and error presentation.
+// Error presentation.
 //
-// Query parameters here are validated by whitelist rather than sanitised: a
-// dashboard has a fixed set of sorts and ranges, and accepting anything else
-// only creates a way for a bad value to reach a query.
-
-var validSorts = map[string]bool{
-	"views": true, "gained": true, "recent": true, "title": true, "fetched": true,
-}
-
-var validWindows = map[string]bool{
-	"24h": true, "168h": true, "720h": true, "2160h": true,
-}
-
-func validPlatform(p string) bool {
-	switch domain.Platform(p) {
-	case domain.PlatformYouTube, domain.PlatformTikTok, domain.PlatformMeta:
-		return true
-	default:
-		return false
-	}
-}
-
-// firstOf returns value when it is allowed, and the fallback otherwise.
-func firstOf(value, fallback string, allowed map[string]bool) string {
-	if allowed[value] {
-		return value
-	}
-	return fallback
-}
-
-// bucketFor picks a chart resolution for a range.
-//
-// A 90-day range at six-hourly readings is 360 points across a 720-pixel chart:
-// two pixels each, which is noise rather than detail. Bucketing keeps the shape
-// and drops the crowding.
-func bucketFor(window time.Duration) postgres.Bucket {
-	switch {
-	case window <= 48*time.Hour:
-		return postgres.BucketRaw
-	case window <= 30*24*time.Hour:
-		return postgres.BucketHour
-	default:
-		return postgres.BucketDay
-	}
-}
-
-func platformOptions(platforms []domain.Platform, selected string) []Option {
-	out := make([]Option, 0, len(platforms))
-	for _, p := range platforms {
-		out = append(out, Option{
-			Value:    string(p),
-			Label:    platformName(p),
-			Selected: string(p) == selected,
-		})
-	}
-	return out
-}
-
-func rangeOptions(selected string) []Option {
-	out := make([]Option, 0, len(windowOptions))
-	for _, o := range windowOptions {
-		out = append(out, Option{Value: o.value, Label: o.label, Selected: o.value == selected})
-	}
-	return out
-}
+// The messages here are written for a reader rather than passed through from
+// the API: "record not found" is accurate and unhelpful, and somebody looking
+// at a dashboard needs to know what to do next, not what the storage layer
+// called it.
 
 // timezoneOptions is a short list rather than the full IANA database.
 //
@@ -118,89 +54,6 @@ func timezoneOptions(selected string) []Option {
 		out = append(out, Option{Value: tz, Label: tz, Selected: tz == selected})
 	}
 	return out
-}
-
-func toSummary(s *tracking.Summary) SummaryView {
-	view := SummaryView{
-		Tracked:     s.TrackedVideos,
-		TotalViews:  compact(uint64(max(s.TotalViews, 0))),
-		TotalExact:  comma(s.TotalViews) + " views",
-		Gained:      signed(&s.ViewsGained),
-		GainedClass: deltaClass(&s.ViewsGained),
-		Stale:       s.Stale,
-		Unavailable: s.Unavailable,
-		Window:      s.Window,
-	}
-	for _, p := range s.Platforms {
-		view.ByPlatform = append(view.ByPlatform, PlatformCount{
-			Platform: p, Name: platformName(p), Count: s.ByPlatform[string(p)],
-		})
-	}
-	return view
-}
-
-func toSchedule(v *domain.Video) ScheduleView {
-	view := ScheduleView{
-		Interval:    duration(v.Schedule.Interval),
-		Failures:    v.Schedule.ConsecutiveFailures,
-		LastError:   v.Schedule.LastFetchError,
-		Retired:     v.Schedule.Retired(),
-		RetiredAt:   v.Schedule.UnavailableSince,
-		Trackers:    v.Schedule.TrackerCount,
-		NextFetch:   "not scheduled",
-		NextFetchAt: v.Schedule.NextFetchAt,
-	}
-	if at := v.Schedule.NextFetchAt; at != nil {
-		if at.Before(time.Now()) {
-			view.NextFetch = "due now"
-		} else {
-			view.NextFetch = "in " + duration(time.Until(*at).Round(time.Minute))
-		}
-	}
-	return view
-}
-
-func toAttempts(attempts []domain.FetchAttempt) []AttemptView {
-	out := make([]AttemptView, 0, len(attempts))
-	for _, a := range attempts {
-		out = append(out, AttemptView{
-			When:     ago(&a.StartedAt),
-			WhenAt:   a.StartedAt,
-			Status:   attemptLabel(a.Status),
-			Tone:     attemptTone(a.Status),
-			Duration: strconv.Itoa(a.DurationMS) + " ms",
-			Error:    a.ErrorDetail,
-		})
-	}
-	return out
-}
-
-func attemptLabel(s domain.AttemptStatus) string {
-	switch s {
-	case domain.AttemptOK:
-		return "OK"
-	case domain.AttemptNotFound:
-		return "Not found"
-	case domain.AttemptBlocked:
-		return "Blocked"
-	case domain.AttemptRateLimited:
-		return "Rate limited"
-	case domain.AttemptTimeout:
-		return "Timed out"
-	default:
-		return "Failed"
-	}
-}
-
-func attemptTone(s domain.AttemptStatus) string {
-	switch s {
-	case domain.AttemptOK:
-		return "ok"
-	case domain.AttemptNotFound:
-		return "critical"
-	default:
-		return "warning"
-	}
 }
 
 // ---------- error presentation ----------
@@ -249,13 +102,7 @@ func errorCopy(err error, status int) (heading, message, backTo, backLabel strin
 	switch {
 	case errors.Is(err, domain.ErrRecordNotFound), errors.Is(err, domain.ErrNotFound):
 		return "Not found",
-			"That video is not on your list. It may have been removed, or the link may be wrong.",
-			backTo, backLabel
-
-	case errors.Is(err, domain.ErrGone):
-		return "No longer available",
-			"The platform reported this video as removed, so it is no longer refreshed. " +
-				"Everything already collected is kept.",
+			"That lookup is not in your history. It may have been deleted, or the link may be wrong.",
 			backTo, backLabel
 
 	case errors.Is(err, domain.ErrRegistrationClosed):
@@ -281,15 +128,15 @@ func errorCopy(err error, status int) (heading, message, backTo, backLabel strin
 	}
 }
 
-// addFailureMessage explains why a video could not be tracked.
-func addFailureMessage(err error) string {
+// lookupFailureMessage explains why a URL could not be looked up.
+func lookupFailureMessage(err error) string {
 	switch {
 	case errors.Is(err, domain.ErrUnsupported):
-		return "That link is not from a platform this service tracks. YouTube, TikTok, Instagram and Facebook links work."
+		return "That link is not from a platform this service reads. YouTube, TikTok, Instagram and Facebook links work."
 	case errors.Is(err, domain.ErrInvalidURL):
 		return "That does not look like a video link. Copy the address of the video itself rather than a profile or a search."
-	case errors.Is(err, domain.ErrLimitReached):
-		return "You have reached the limit on tracked videos. Remove one to make room."
+	case errors.Is(err, domain.ErrRateLimited):
+		return "The platform is rate-limiting us right now. Try again in a few minutes."
 	case errors.Is(err, domain.ErrNotFound):
 		return "The platform says that video does not exist. Check the link is right and the video is public."
 	case errors.Is(err, domain.ErrBlocked):
@@ -298,7 +145,7 @@ func addFailureMessage(err error) string {
 	case errors.Is(err, domain.ErrMisconfigured):
 		return "That platform is not enabled on this deployment."
 	default:
-		return "That video could not be added. Try again in a moment."
+		return "That video could not be looked up. Try again in a moment."
 	}
 }
 
@@ -387,8 +234,6 @@ func statusFor(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, domain.ErrRecordNotFound), errors.Is(err, domain.ErrNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, domain.ErrGone):
-		return http.StatusGone
 	case errors.Is(err, domain.ErrConflict):
 		return http.StatusConflict
 	case errors.Is(err, domain.ErrLimitReached):

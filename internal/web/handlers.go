@@ -5,13 +5,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/foodibd/socialstats/internal/auth"
 	"github.com/foodibd/socialstats/internal/domain"
 	"github.com/foodibd/socialstats/internal/httpx"
-	"github.com/foodibd/socialstats/internal/storage/postgres"
-	"github.com/foodibd/socialstats/internal/tracking"
 )
 
 // Handlers.
@@ -19,10 +16,10 @@ import (
 // Every state-changing handler follows post-redirect-get: it does the work,
 // queues a flash message and redirects. Rendering the result of a POST directly
 // would leave the browser on a URL that re-submits on refresh and behaves badly
-// under the back button — which for "stop tracking" is a genuinely annoying way
-// to lose something.
+// under the back button — which for a lookup means spending an API call every
+// time somebody hits reload.
 
-// Dashboard renders the tracked video list.
+// Dashboard renders the lookup form and this user's history.
 func (s *Server) Dashboard(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFrom(r.Context())
 	if user == nil {
@@ -30,182 +27,34 @@ func (s *Server) Dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	q := r.URL.Query()
-	sort := firstOf(q.Get("sort"), "views", validSorts)
-	window := firstOf(q.Get("window"), "168h", validWindows)
-	platform := q.Get("platform")
-	if !validPlatform(platform) {
-		platform = ""
-	}
-
-	windowDuration, err := time.ParseDuration(window)
-	if err != nil {
-		windowDuration = 7 * 24 * time.Hour
-	}
-
-	entries, err := s.tracking.List(r.Context(), tracking.ListQuery{
-		UserID:   user.ID,
-		Window:   windowDuration,
-		Platform: domain.Platform(platform),
-		Sort:     postgres.DashboardSort(sort),
-		Limit:    200,
-		// The sparkline is the column that makes a list of numbers legible at a
-		// glance, so the dashboard pays for it here even though the JSON API
-		// leaves it off by default.
-		Sparkline: 24,
-	})
+	history, err := s.lookups.History(r.Context(), user.ID)
 	if err != nil {
 		s.renderError(w, r, err)
 		return
 	}
 
-	summary, err := s.tracking.Summarise(r.Context(), user.ID, windowDuration, 0)
-	if err != nil {
-		s.renderError(w, r, err)
-		return
+	rows := make([]LookupRow, 0, len(history))
+	for _, l := range history {
+		rows = append(rows, toRow(l))
 	}
-
-	rows := make([]VideoRow, 0, len(entries))
-	for _, e := range entries {
-		rows = append(rows, toRow(e))
-	}
-
-	filters := buildFilters(sort, platform, window)
-	filters.PlatformOptions = platformOptions(s.platformsFor(), platform)
 
 	s.render(w, r, http.StatusOK, "dashboard.html", Page{
 		Title: "Dashboard",
 		Nav:   "dashboard",
 		Data: DashboardView{
-			Videos:  rows,
-			Summary: toSummary(summary),
-			Filters: filters,
-			// "Nothing tracked yet" and "nothing matches this filter" need
-			// different words, so the two cases are distinguished here rather
-			// than both rendering as an empty table.
-			Empty: summary.TrackedVideos == 0,
+			Recent:    rows,
+			Platforms: s.lookups.Platforms(),
+			Empty:     len(rows) == 0,
 		},
 	})
 }
 
-// Video renders one video's detail page.
-func (s *Server) Video(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFrom(r.Context())
-	if user == nil {
-		s.redirectToLogin(w, r)
-		return
-	}
-
-	id := r.PathValue("id")
-	rangeWindow := firstOf(r.URL.Query().Get("range"), "168h", validWindows)
-	windowDuration, err := time.ParseDuration(rangeWindow)
-	if err != nil {
-		windowDuration = 7 * 24 * time.Hour
-	}
-
-	entry, err := s.tracking.Get(r.Context(), user.ID, id)
-	if err != nil {
-		s.renderError(w, r, err)
-		return
-	}
-	tracked, err := s.tracking.Tracked(r.Context(), user.ID, id)
-	if err != nil {
-		s.renderError(w, r, err)
-		return
-	}
-
-	now := time.Now()
-	history, err := s.tracking.HistoryFor(r.Context(), tracking.HistoryQuery{
-		UserID: user.ID, PublicID: id,
-		From: now.Add(-windowDuration), To: now,
-		// Hourly, not raw: a 90-day range at six-hourly readings is 360 points
-		// through a 720-pixel chart, and the extra detail is noise the reader
-		// cannot see anyway.
-		Bucket: bucketFor(windowDuration),
-	})
-	if err != nil {
-		s.renderError(w, r, err)
-		return
-	}
-
-	attempts, err := s.tracking.Attempts(r.Context(), user.ID, id, 15)
-	if err != nil {
-		s.renderError(w, r, err)
-		return
-	}
-
-	// The growth figure on this page has to be measured over the range being
-	// charted, or the headline and the chart disagree about the same video.
-	scoped, err := s.tracking.List(r.Context(), tracking.ListQuery{
-		UserID: user.ID, Window: windowDuration, Limit: 200,
-	})
-	if err != nil {
-		s.renderError(w, r, err)
-		return
-	}
-
-	row := toRow(*entry)
-	for _, e := range scoped {
-		if e.Video.PublicID == id {
-			row = toRow(e)
-			break
-		}
-	}
-
-	view := VideoView{
-		Row:      row,
-		Notes:    tracked.Notes,
-		Chart:    Chart(history.Snapshots),
-		Range:    rangeWindow,
-		Ranges:   rangeOptions(rangeWindow),
-		Points:   len(history.Snapshots) + len(history.Daily),
-		Source:   history.Source,
-		Attempts: toAttempts(attempts),
-		Schedule: toSchedule(entry.Video),
-	}
-
-	s.render(w, r, http.StatusOK, "video.html", Page{
-		Title: row.Title,
-		Nav:   "dashboard",
-		Data:  view,
-	})
-}
-
-// AddVideo handles the dashboard's track form.
-func (s *Server) AddVideo(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFrom(r.Context())
-	if user == nil {
-		s.redirectToLogin(w, r)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		s.setFlash(w, "error", "That form could not be read.")
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-
-	entry, err := s.tracking.Add(r.Context(), user.ID,
-		r.PostFormValue("url"), r.PostFormValue("label"))
-	if err != nil {
-		s.setFlash(w, "error", addFailureMessage(err))
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-
-	// The first fetch may have failed while the tracking succeeded, and saying
-	// so plainly is better than a success message next to an empty figure.
-	if entry.Video.Latest.ViewCount == nil && entry.Video.Schedule.LastFetchStatus != domain.FetchOK {
-		s.setFlash(w, "info",
-			"Tracking started, but "+platformName(entry.Video.Platform)+
-				" did not return figures on the first try. It will be retried automatically.")
-	} else {
-		s.setFlash(w, "success", "Now tracking "+videoTitle(entry.Video, entry.Label)+".")
-	}
-	http.Redirect(w, r, "/videos/"+entry.Video.PublicID, http.StatusSeeOther)
-}
-
-// UpdateVideo saves the per-user label and notes.
-func (s *Server) UpdateVideo(w http.ResponseWriter, r *http.Request) {
+// Lookup handles the paste-a-URL form.
+//
+// The fetch happens here, synchronously, because the whole point of the page is
+// that a pasted link produces a number now. The service bounds it with a
+// timeout so a slow platform cannot hold the request open.
+func (s *Server) Lookup(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFrom(r.Context())
 	if user == nil {
 		s.redirectToLogin(w, r)
@@ -216,61 +65,65 @@ func (s *Server) UpdateVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.PathValue("id")
-	if _, err := s.tracking.Update(r.Context(), user.ID, id,
-		r.PostFormValue("label"), r.PostFormValue("notes")); err != nil {
-		s.renderError(w, r, err)
+	rawURL := strings.TrimSpace(r.PostFormValue("url"))
+	if rawURL == "" {
+		s.setFlash(w, "error", "Paste a video link first.")
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 
-	s.setFlash(w, "success", "Saved.")
-	http.Redirect(w, r, "/videos/"+id, http.StatusSeeOther)
+	result, err := s.lookups.Lookup(r.Context(), user.ID, rawURL)
+	if err != nil {
+		s.log.WarnContext(r.Context(), "lookup failed", "url", rawURL, "error", err)
+		s.setFlash(w, "error", lookupFailureMessage(err))
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	// Straight to the result rather than back to the list: the user asked a
+	// question and the answer is the page they want to be on.
+	http.Redirect(w, r, "/lookups/"+result.PublicID, http.StatusSeeOther)
 }
 
-// RemoveVideo untracks a video.
-//
-// A form post rather than DELETE, because HTML forms only speak GET and POST.
-// Faking the method with a hidden _method field is a convention borrowed from
-// frameworks that need it; here the route can simply say what it does.
-func (s *Server) RemoveVideo(w http.ResponseWriter, r *http.Request) {
+// LookupDetail renders one past lookup.
+func (s *Server) LookupDetail(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFrom(r.Context())
 	if user == nil {
 		s.redirectToLogin(w, r)
 		return
 	}
 
-	if err := s.tracking.Remove(r.Context(), user.ID, r.PathValue("id")); err != nil {
+	record, err := s.lookups.Get(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
 		s.renderError(w, r, err)
 		return
 	}
 
-	s.setFlash(w, "success", "Stopped tracking. The history has been kept, so adding it back restores it.")
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	view := toLookupView(*record)
+	s.render(w, r, http.StatusOK, "lookup.html", Page{
+		Title: view.Row.Title,
+		Nav:   "dashboard",
+		Data:  view,
+	})
 }
 
-// RefreshVideo brings the next fetch forward.
-func (s *Server) RefreshVideo(w http.ResponseWriter, r *http.Request) {
+// RemoveLookup deletes one entry from the history.
+func (s *Server) RemoveLookup(w http.ResponseWriter, r *http.Request) {
 	user := auth.UserFrom(r.Context())
 	if user == nil {
 		s.redirectToLogin(w, r)
 		return
 	}
 
-	id := r.PathValue("id")
-	if _, err := s.tracking.Refresh(r.Context(), user.ID, id); err != nil {
-		if errors.Is(err, domain.ErrGone) {
-			s.setFlash(w, "error", "That video has been removed by its platform, so it is no longer fetched.")
-			http.Redirect(w, r, "/videos/"+id, http.StatusSeeOther)
+	if err := s.lookups.Remove(r.Context(), user.ID, r.PathValue("id")); err != nil {
+		if !errors.Is(err, domain.ErrRecordNotFound) {
+			s.renderError(w, r, err)
 			return
 		}
-		s.renderError(w, r, err)
-		return
 	}
 
-	// Queued, not fetched — and the copy says so, because a "Refreshed" message
-	// followed by an unchanged number reads as a broken button.
-	s.setFlash(w, "info", "Queued for the next refresh cycle.")
-	http.Redirect(w, r, "/videos/"+id, http.StatusSeeOther)
+	s.setFlash(w, "success", "Removed from your history.")
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // ---------- accounts ----------
@@ -421,7 +274,7 @@ func (s *Server) Settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tracked, err := s.tracking.List(r.Context(), tracking.ListQuery{UserID: user.ID, Limit: 200})
+	history, err := s.lookups.History(r.Context(), user.ID)
 	if err != nil {
 		s.renderError(w, r, err)
 		return
@@ -432,7 +285,7 @@ func (s *Server) Settings(w http.ResponseWriter, r *http.Request) {
 		Nav:   "settings",
 		Data: map[string]any{
 			"Timezones": timezoneOptions(user.Timezone),
-			"Tracked":   len(tracked),
+			"Lookups":   len(history),
 			"Joined":    user.CreatedAt.Format("2 January 2006"),
 			"JoinedAt":  &user.CreatedAt,
 		},

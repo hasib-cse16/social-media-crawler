@@ -15,8 +15,7 @@ import (
 	"time"
 
 	"github.com/foodibd/socialstats/internal/auth"
-	"github.com/foodibd/socialstats/internal/domain"
-	"github.com/foodibd/socialstats/internal/tracking"
+	"github.com/foodibd/socialstats/internal/lookup"
 )
 
 //go:embed templates/*.html templates/partials/*.html
@@ -27,9 +26,9 @@ var staticFS embed.FS
 
 // Server renders the dashboard.
 type Server struct {
-	tracking *tracking.Service
-	auth     *auth.Service
-	log      *slog.Logger
+	lookups *lookup.Service
+	auth    *auth.Service
+	log     *slog.Logger
 
 	templates map[string]*template.Template
 	version   string
@@ -71,9 +70,9 @@ type Config struct {
 // Parsing at boot rather than per request is not only faster: a template with a
 // typo in it fails the process at startup, where a deploy notices, instead of
 // on the one page nobody visited before release.
-func New(trackingSvc *tracking.Service, authSvc *auth.Service, cfg Config, log *slog.Logger) (*Server, error) {
+func New(lookupSvc *lookup.Service, authSvc *auth.Service, cfg Config, log *slog.Logger) (*Server, error) {
 	s := &Server{
-		tracking:         trackingSvc,
+		lookups:          lookupSvc,
 		auth:             authSvc,
 		log:              log.With("component", "web"),
 		version:          cfg.Version,
@@ -100,7 +99,7 @@ func New(trackingSvc *tracking.Service, authSvc *auth.Service, cfg Config, log *
 // without being listed one page at a time.
 var pages = []string{
 	"dashboard.html",
-	"video.html",
+	"lookup.html",
 	"login.html",
 	"register.html",
 	"settings.html",
@@ -133,18 +132,11 @@ func (s *Server) funcMap() template.FuncMap {
 		"compactPtr":   compactPtr,
 		"exact":        exact,
 		"comma":        comma,
-		"signed":       signed,
-		"deltaClass":   deltaClass,
 		"ago":          ago,
 		"timestamp":    timestamp,
-		"duration":     duration,
 		"platformName": platformName,
 		"truncate":     truncate,
 		"plural":       pluralise,
-		"percent":      percent,
-		"itoa":         itoa,
-		"windowLabel":  windowLabel,
-		"queryString":  queryString,
 		"asset":        s.asset,
 		"lower":        strings.ToLower,
 	}
@@ -220,9 +212,6 @@ func (s *Server) StaticHandler() http.Handler {
 
 // AssetPrefix is the route prefix the static handler is mounted at.
 const AssetPrefix = "/static/"
-
-// platformsFor lists the platforms this deployment tracks, for the filter.
-func (s *Server) platformsFor() []domain.Platform { return s.tracking.Platforms() }
 
 // hashAssets fingerprints the embedded static files.
 //

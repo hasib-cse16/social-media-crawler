@@ -47,16 +47,6 @@ func countValue(v *int64) *uint64 {
 	return &n
 }
 
-// secondsToDuration converts an EXTRACT(EPOCH FROM interval) result.
-//
-// Intervals are read as seconds in SQL rather than scanned as pgtype.Interval
-// because an interval's month component has no fixed length, and a Duration
-// implies one. Every interval this schema stores is measured in hours, so the
-// conversion is exact — and doing it in SQL keeps that assumption in one place.
-func secondsToDuration(seconds int64) time.Duration {
-	return time.Duration(seconds) * time.Second
-}
-
 // nullableString flattens a nullable text column.
 func nullableString(v *string) string {
 	if v == nil {
@@ -83,14 +73,4 @@ func errNoRowsAffected(what string, id any) error {
 // strconvSeconds renders a Duration as a whole number of seconds.
 func strconvSeconds(d time.Duration) string {
 	return strconv.FormatInt(int64(d/time.Second), 10)
-}
-
-// optionalIntervalArg renders a Duration as a Postgres interval literal, or nil
-// when it is unset so a column default applies.
-func optionalIntervalArg(d time.Duration) *string {
-	if d <= 0 {
-		return nil
-	}
-	s := strconvSeconds(d) + " seconds"
-	return &s
 }

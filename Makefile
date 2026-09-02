@@ -30,8 +30,7 @@ test: ## run unit tests (no database needed); RACE= to drop the race detector
 
 test-db: ## run integration tests against the disposable test database
 	TEST_DATABASE_URL=$(TEST_DATABASE_URL) go test $(RACE) -count=1 \
-	  ./internal/storage/... ./internal/auth/... ./internal/tracking/... \
-	  ./internal/poller/... ./internal/web/...
+	  ./internal/storage/... ./internal/auth/... ./internal/lookup/... ./internal/web/...
 
 cover: ## run tests and open a coverage summary
 	go test -coverprofile=coverage.out ./...

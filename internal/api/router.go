@@ -25,8 +25,8 @@ type RouterConfig struct {
 	// Middleware attaches the caller's identity and enforces CSRF.
 	Middleware *auth.Middleware
 
-	// Tracking serves the dashboard's data endpoints.
-	Tracking *TrackingHandler
+	// Lookups serves the dashboard's data endpoints.
+	Lookups *LookupHandler
 
 	// Web registers the server-rendered dashboard. It is optional: a deployment
 	// can serve the JSON API alone.
@@ -74,22 +74,17 @@ func NewRouter(h *Handler, log *slog.Logger, cfg RouterConfig) http.Handler {
 		mux.Handle("POST /v1/auth/password", mw.Require(http.HandlerFunc(cfg.Auth.ChangePassword)))
 	}
 
-	if cfg.Tracking != nil && cfg.Middleware != nil {
+	if cfg.Lookups != nil && cfg.Middleware != nil {
 		mw := cfg.Middleware
 
-		// Every tracking route is scoped to the caller, so Require is applied
-		// to each one individually. Protecting a subtree instead would mean the
+		// Every lookup route is scoped to the caller, so Require is applied to
+		// each one individually. Protecting a subtree instead would mean the
 		// next route added outside it is silently public.
 		for pattern, handler := range map[string]http.HandlerFunc{
-			"GET /v1/videos":               cfg.Tracking.List,
-			"POST /v1/videos":              cfg.Tracking.Add,
-			"GET /v1/videos/{id}":          cfg.Tracking.Get,
-			"PATCH /v1/videos/{id}":        cfg.Tracking.Update,
-			"DELETE /v1/videos/{id}":       cfg.Tracking.Remove,
-			"GET /v1/videos/{id}/history":  cfg.Tracking.History,
-			"GET /v1/videos/{id}/attempts": cfg.Tracking.Attempts,
-			"POST /v1/videos/{id}/refresh": cfg.Tracking.Refresh,
-			"GET /v1/dashboard/summary":    cfg.Tracking.Summary,
+			"GET /v1/lookups":         cfg.Lookups.List,
+			"POST /v1/lookups":        cfg.Lookups.Create,
+			"GET /v1/lookups/{id}":    cfg.Lookups.Get,
+			"DELETE /v1/lookups/{id}": cfg.Lookups.Remove,
 		} {
 			mux.Handle(pattern, mw.Require(handler))
 		}

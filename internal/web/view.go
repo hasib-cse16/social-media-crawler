@@ -1,13 +1,9 @@
 package web
 
 import (
-	"html/template"
-	"net/url"
-	"strconv"
 	"time"
 
 	"github.com/foodibd/socialstats/internal/domain"
-	"github.com/foodibd/socialstats/internal/tracking"
 )
 
 // View models.
@@ -30,70 +26,53 @@ type Page struct {
 	Data      any
 }
 
-// DashboardView backs the main list.
+// DashboardView backs the main page: the paste-a-URL form and what has been
+// looked up before.
 type DashboardView struct {
-	Videos    []VideoRow
-	Summary   SummaryView
-	Filters   Filters
+	Recent    []LookupRow
 	Platforms []domain.Platform
 	Empty     bool
 }
 
-// VideoRow is one line of the dashboard.
-type VideoRow struct {
+// LookupRow is one line of the history list.
+type LookupRow struct {
 	ID           string
 	Title        string
 	Caption      string
 	Platform     domain.Platform
 	PlatformName string
 	CanonicalURL string
+
 	ChannelTitle string
+	ChannelURL   string
+	ChannelEmail string
 
 	Views      string
 	ViewsExact string
 	Likes      string
 	Comments   string
+	Shares     string
+	Saves      string
 
-	Gained      string
-	GainedClass string
-	BaselineAt  *time.Time
-
-	Sparkline  template.HTML
-	Fresh      bool
-	Status     string
-	Tone       string
-	LastRead   string
-	LastReadAt *time.Time
+	When   string
+	WhenAt *time.Time
 }
 
-// SummaryView is the headline strip.
-type SummaryView struct {
-	Tracked     int
-	TotalViews  string
-	TotalExact  string
-	Gained      string
-	GainedClass string
-	Stale       int
-	Unavailable int
-	Window      string
-	ByPlatform  []PlatformCount
+// LookupView backs the detail page for one past lookup.
+type LookupView struct {
+	Row LookupRow
+
+	// PublishedAt and ChannelDescription are shown only here rather than in the
+	// list, because they are what someone drills in for.
+	Published          string
+	PublishedAt        *time.Time
+	ChannelID          string
+	ChannelDescription string
 }
 
-type PlatformCount struct {
-	Platform domain.Platform
-	Name     string
-	Count    int
-}
-
-// Filters is the current list query, echoed back so the controls show what is
-// actually applied rather than their defaults.
-type Filters struct {
-	Sort            string
-	Platform        string
-	Window          string
-	Windows         []Option
-	Sorts           []Option
-	PlatformOptions []Option
+// SettingsView backs the account page.
+type SettingsView struct {
+	Timezones []Option
 }
 
 // Option is one choice in a select control.
@@ -103,159 +82,42 @@ type Option struct {
 	Selected bool
 }
 
-// VideoView backs the detail page.
-type VideoView struct {
-	Row      VideoRow
-	Notes    string
-	Chart    template.HTML
-	Range    string
-	Ranges   []Option
-	Points   int
-	Source   string
-	Attempts []AttemptView
-	Schedule ScheduleView
-}
+// toRow maps a stored lookup into its row.
+func toRow(l domain.Lookup) LookupRow {
+	row := LookupRow{
+		ID:           l.PublicID,
+		Title:        lookupTitle(l),
+		Platform:     l.Platform,
+		PlatformName: platformName(l.Platform),
+		CanonicalURL: l.CanonicalURL,
 
-// ScheduleView is the "why does this number look like that?" panel.
-//
-// It is on the page because the honest answer to a stale figure is usually
-// about the poller rather than the video, and a dashboard that cannot explain
-// itself gets distrusted for the wrong reasons.
-type ScheduleView struct {
-	Interval    string
-	NextFetch   string
-	NextFetchAt *time.Time
-	Failures    int
-	LastError   string
-	Retired     bool
-	RetiredAt   *time.Time
-	Trackers    int
-}
+		ChannelTitle: l.ChannelTitle,
+		ChannelURL:   l.ChannelURL,
+		ChannelEmail: l.ChannelEmail,
 
-// AttemptView is one row of the fetch log.
-type AttemptView struct {
-	When     string
-	WhenAt   time.Time
-	Status   string
-	Tone     string
-	Duration string
-	Error    string
-}
+		Views:      compactPtr(l.ViewCount),
+		ViewsExact: exact(l.ViewCount),
+		Likes:      compactPtr(l.LikeCount),
+		Comments:   compactPtr(l.CommentCount),
+		Shares:     compactPtr(l.ShareCount),
+		Saves:      compactPtr(l.SaveCount),
 
-// SettingsView backs the account page.
-type SettingsView struct {
-	Timezones []Option
-}
-
-// toRow maps a tracking entry into its row.
-func toRow(e tracking.Entry) VideoRow {
-	v := e.Video
-
-	row := VideoRow{
-		ID:           v.PublicID,
-		Title:        videoTitle(v, e.Label),
-		Platform:     v.Platform,
-		PlatformName: platformName(v.Platform),
-		CanonicalURL: v.CanonicalURL,
-		ChannelTitle: v.ChannelTitle,
-
-		Views:      compactPtr(v.Latest.ViewCount),
-		ViewsExact: exact(v.Latest.ViewCount),
-		Likes:      compactPtr(v.Latest.LikeCount),
-		Comments:   compactPtr(v.Latest.CommentCount),
-
-		Gained:      signed(e.ViewsGained),
-		GainedClass: deltaClass(e.ViewsGained),
-		BaselineAt:  e.BaselineAt,
-
-		Fresh:      e.Fresh,
-		Status:     statusLabel(v),
-		Tone:       statusTone(v),
-		LastRead:   ago(v.LatestCapturedAt),
-		LastReadAt: v.LatestCapturedAt,
+		When:   ago(&l.LookedUpAt),
+		WhenAt: &l.LookedUpAt,
 	}
-
-	// The caption is shown under the title only when it is not already the
-	// title, so a row does not repeat itself.
-	if e.Label != "" && v.Title != "" {
-		row.Caption = truncate(v.Title, 90)
-	} else if v.Title != "" && v.ChannelTitle != "" {
-		row.Caption = v.ChannelTitle
-	}
-
-	if len(e.Sparkline) > 0 {
-		row.Sparkline = Sparkline(e.Sparkline)
+	if l.ChannelTitle != "" {
+		row.Caption = l.ChannelTitle
 	}
 	return row
 }
 
-// windowOptions are the ranges the growth figure can be measured over.
-var windowOptions = []struct {
-	value string
-	label string
-}{
-	{"24h", "24 hours"},
-	{"168h", "7 days"},
-	{"720h", "30 days"},
-	{"2160h", "90 days"},
+// toLookupView maps a stored lookup into the detail page.
+func toLookupView(l domain.Lookup) LookupView {
+	return LookupView{
+		Row:                toRow(l),
+		Published:          ago(l.PublishedAt),
+		PublishedAt:        l.PublishedAt,
+		ChannelID:          l.ChannelID,
+		ChannelDescription: l.ChannelDescription,
+	}
 }
-
-var sortOptions = []struct {
-	value string
-	label string
-}{
-	{"views", "Most views"},
-	{"gained", "Fastest growing"},
-	{"recent", "Recently added"},
-	{"title", "Name"},
-	{"fetched", "Last updated"},
-}
-
-func buildFilters(sort, platform, window string) Filters {
-	f := Filters{Sort: sort, Platform: platform, Window: window}
-
-	for _, o := range windowOptions {
-		f.Windows = append(f.Windows, Option{Value: o.value, Label: o.label, Selected: o.value == window})
-	}
-	for _, o := range sortOptions {
-		f.Sorts = append(f.Sorts, Option{Value: o.value, Label: o.label, Selected: o.value == sort})
-	}
-	return f
-}
-
-// queryString rebuilds the list query with one parameter changed, so the
-// controls preserve the rest of the filters instead of resetting them.
-func queryString(f Filters, key, value string) string {
-	q := url.Values{}
-	set := func(k, v string) {
-		if k == key {
-			v = value
-		}
-		if v != "" {
-			q.Set(k, v)
-		}
-	}
-	set("sort", f.Sort)
-	set("platform", f.Platform)
-	set("window", f.Window)
-
-	if key != "sort" && key != "platform" && key != "window" && value != "" {
-		q.Set(key, value)
-	}
-	if len(q) == 0 {
-		return "/"
-	}
-	return "/?" + q.Encode()
-}
-
-// windowLabel turns a duration string back into the words used in the picker.
-func windowLabel(window string) string {
-	for _, o := range windowOptions {
-		if o.value == window {
-			return o.label
-		}
-	}
-	return window
-}
-
-func itoa(n int) string { return strconv.Itoa(n) }

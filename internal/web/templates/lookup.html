@@ -1,0 +1,75 @@
+{{ define "main" }}
+{{ $d := .Data }}
+{{ $r := $d.Row }}
+
+<p class="subtitle"><a href="/">← Back to your lookups</a></p>
+
+<h1>{{ $r.Title }}</h1>
+<p class="subtitle">
+  <span class="pill pill-{{ lower (printf "%s" $r.Platform) }}">{{ $r.PlatformName }}</span>
+  <a href="{{ $r.CanonicalURL }}" rel="noopener noreferrer" target="_blank">Open on {{ $r.PlatformName }}</a>
+  · read {{ $r.When }}
+</p>
+
+<dl class="summary">
+  <div class="stat">
+    <dt>Views</dt>
+    <dd title="{{ $r.ViewsExact }} views">{{ $r.Views }}</dd>
+  </div>
+  <div class="stat">
+    <dt>Likes</dt>
+    <dd>{{ $r.Likes }}</dd>
+  </div>
+  <div class="stat">
+    <dt>Comments</dt>
+    <dd>{{ $r.Comments }}</dd>
+  </div>
+  {{ with $r.Shares }}<div class="stat"><dt>Shares</dt><dd>{{ . }}</dd></div>{{ end }}
+  {{ with $r.Saves }}<div class="stat"><dt>Saves</dt><dd>{{ . }}</dd></div>{{ end }}
+</dl>
+
+<p class="hint">
+  These are the figures the platform reported at {{ timestamp $r.WhenAt }}. They are not
+  refreshed — look the link up again for current numbers.
+</p>
+
+<section class="panel">
+  <div class="panel-head"><h2 style="margin:0">Channel</h2></div>
+  <div class="panel-body">
+    <dl class="detail">
+      <dt>Name</dt>
+      <dd>
+        {{ if $r.ChannelURL }}
+          <a href="{{ $r.ChannelURL }}" rel="noopener noreferrer" target="_blank">{{ $r.ChannelTitle }}</a>
+        {{ else }}{{ or $r.ChannelTitle "—" }}{{ end }}
+      </dd>
+
+      <dt>Email</dt>
+      <dd>
+        {{ if $r.ChannelEmail }}
+          <a href="mailto:{{ $r.ChannelEmail }}">{{ $r.ChannelEmail }}</a>
+        {{ else }}
+          <span class="muted">Not published</span>
+        {{ end }}
+      </dd>
+
+      {{ with $d.ChannelID }}<dt>Channel ID</dt><dd><code>{{ . }}</code></dd>{{ end }}
+      {{ with $d.PublishedAt }}<dt>Published</dt><dd title="{{ timestamp . }}">{{ $d.Published }}</dd>{{ end }}
+    </dl>
+
+    {{ with $d.ChannelDescription }}
+    <h3>About</h3>
+    <p class="channel-about">{{ . }}</p>
+    <p class="hint">
+      The email above is read out of this text, which is where channel owners publish it. If it
+      picked the wrong address, the right one is somewhere in here.
+    </p>
+    {{ end }}
+  </div>
+</section>
+
+<form method="post" action="/lookups/{{ $r.ID }}/delete" style="margin-top:20px">
+  <input type="hidden" name="csrf_token" value="{{ $.CSRFToken }}">
+  <button type="submit" class="btn">Remove from history</button>
+</form>
+{{ end }}

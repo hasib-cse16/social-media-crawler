@@ -1,8 +1,13 @@
 # socialstats
 
-A dashboard and HTTP service for tracking public view counts. Paste a video
-URL, and it is refreshed on a schedule so you can see how it moves. YouTube,
-TikTok and Meta (Facebook + Instagram) are implemented behind one interface.
+A dashboard and HTTP service for reading public view counts. Paste a video URL
+and get its numbers, plus who posted it — including the channel's public
+contact email where the owner published one. YouTube, TikTok and Meta
+(Facebook + Instagram) are implemented behind one interface.
+
+Every lookup is recorded against your account, so the dashboard is a history of
+what you asked. Nothing runs in the background: a lookup is a question, and the
+numbers it returns are what the platform said at that moment.
 
 Two dependencies: `pgx` (there is no PostgreSQL driver in the standard library)
 and `golang.org/x/crypto` (nor an argon2id). No web framework, no ORM, no
@@ -17,9 +22,9 @@ make migrate                  # applies the schema
 make run
 ```
 
-PostgreSQL is required: the dashboard stores users, tracked videos and the
-metric history there, and the service refuses to boot without a reachable
-`DATABASE_URL`. `make db-up` starts one on `:5432` for development and a
+PostgreSQL is required: the dashboard stores accounts, sessions and each user's
+lookup history there, and the service refuses to boot without a reachable
+`DATABASE_URL`. `make db-up` starts one on `:5434` for development and a
 disposable one on `:5433` for integration tests.
 
 The service loads `.env` from the working directory (walking up a few parents,
@@ -48,8 +53,9 @@ Interactive API reference: **<http://localhost:8080/docs>** (Swagger UI).
 Raw spec: **<http://localhost:8080/openapi.yaml>**.
 
 Get an API key: Google Cloud Console → enable **YouTube Data API v3** → create
-an API key. `videos.list` costs 1 unit per call against a 10,000/day quota,
-which is why responses are cached.
+an API key. `videos.list` and `channels.list` cost 1 unit each against a
+10,000/day quota, so a YouTube lookup costs 2 — which is why responses are
+cached.
 
 ## API
 
@@ -57,25 +63,20 @@ which is why responses are cached.
 |--------|---------------|-------------------------------------------|
 | GET    | `/v1/stats`   | `?url=<video url>`                        |
 | POST   | `/v1/stats`   | body `{"url":"..."}`                      |
-| GET    | `/`                 | the dashboard                             |
-| GET    | `/videos/{id}`      | one video: chart, fetch log, notes        |
+| GET    | `/`                 | the dashboard: the form and your history  |
+| GET    | `/lookups/{id}`     | one lookup: counters and channel details  |
 | GET    | `/login`, `/register`, `/settings` | account pages              |
-| GET    | `/v1/videos`        | the caller's tracked videos, with growth  |
-| POST   | `/v1/videos`        | `{url, label?}` — track it, fetching now  |
-| GET    | `/v1/videos/{id}`   | one tracked video                         |
-| PATCH  | `/v1/videos/{id}`   | `{label?, notes?}`                        |
-| DELETE | `/v1/videos/{id}`   | untrack; the history is kept              |
-| GET    | `/v1/videos/{id}/history` | `?from=&to=&bucket=raw\|hour\|day` |
-| GET    | `/v1/videos/{id}/attempts` | recent fetch attempts, successful or not |
-| POST   | `/v1/videos/{id}/refresh` | bring the next fetch forward       |
-| GET    | `/v1/dashboard/summary` | totals, coverage and top movers       |
+| GET    | `/v1/lookups`       | the caller's lookup history, newest first |
+| POST   | `/v1/lookups`       | `{url}` — fetch it now and record it      |
+| GET    | `/v1/lookups/{id}`  | one past lookup                           |
+| DELETE | `/v1/lookups/{id}`  | remove it from the history                |
 | POST   | `/v1/auth/register` | `{email, password, display_name?}` → session |
 | POST   | `/v1/auth/login`    | `{email, password}` → session             |
 | POST   | `/v1/auth/logout`   | ends this session                         |
 | POST   | `/v1/auth/logout-all` | ends every session for the account      |
 | POST   | `/v1/auth/password` | change password; revokes every session    |
 | GET    | `/v1/auth/me`       | the signed-in account                     |
-| GET    | `/healthz`    | liveness + registered platforms + polling state |
+| GET    | `/healthz`    | liveness + registered platforms                 |
 | GET    | `/readyz`     | readiness — 503 when the database is unreachable |
 | GET    | `/docs`       | Swagger UI                                |
 | GET    | `/openapi.yaml` | OpenAPI 3.1 specification               |
@@ -175,92 +176,61 @@ A few properties worth knowing about:
   dump does not yield live sessions — and "log out everywhere" and instant
   revocation come for free, which a stateless signed token would have cost.
 
-## Tracking videos
+## Looking videos up
 
 ```bash
-curl -s -XPOST localhost:8080/v1/videos -H "Authorization: Bearer $TOKEN" \
+curl -s -XPOST localhost:8080/v1/lookups -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://www.tiktok.com/@user/video/7249376077976472833","label":"Q3 launch"}'
+  -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 
-curl -s "localhost:8080/v1/videos?sort=gained&window=168h&sparkline=20" \
-  -H "Authorization: Bearer $TOKEN"
+curl -s localhost:8080/v1/lookups -H "Authorization: Bearer $TOKEN"
 ```
 
-Adding a video **fetches it synchronously**, so the caller gets a number back
-rather than an empty row that fills in some time in the next six hours. If that
-first fetch fails the video is tracked anyway, with the failure recorded on the
-row and in the fetch log — a TikTok challenge at 14:03 is not a reason to refuse
-to track a video, and the poller will try again.
-
-The exception is short links (`vm.tiktok.com`, `fb.watch`). Those carry no id
-until the redirect is followed, so a failed fetch there means we genuinely do
-not know which video was meant, and the request fails.
+A lookup **fetches synchronously**, so the caller gets a number back rather than
+a row that fills in later. `LOOKUP_TIMEOUT` (30s) bounds it, which matters for
+TikTok and Meta: those are page scrapes with retries, and the response waits for
+them.
 
 Details worth knowing:
 
-- **Growth is measured against a baseline, and the baseline is reported.**
-  `views_gained` is the current count minus the last reading at or before the
-  window's start, and `baseline_at` says when that reading was taken. It is
-  absent rather than zero when there is no baseline — a video added yesterday
-  has no week-old reading — and it is **signed**, because platforms revise view
-  counts downward and a negative is a measurement rather than a bug.
-- **A video is shared; the tracking of it is not.** Two accounts following the
-  same video share one row, one time series and one fetch, but keep their own
-  labels and notes. Untracking archives rather than deletes, so re-adding
-  restores both the label and the history.
-- **Ownership is checked, not assumed.** A video the caller does not track
-  returns `404`, not `403`, so the endpoint does not confirm that a video other
-  people are tracking exists.
-- **`POST /{id}/refresh` returns `202` and queues.** Fetching inline on demand
-  would let one impatient account spend everyone's TikTok budget; the poller is
-  what paces platform access.
-- **Freshness is judged per video.** A six-hourly YouTube video and a
-  twelve-hourly TikTok video go stale at different speeds, so `fresh` compares
-  against each video's own interval rather than one cutoff.
+- **A lookup is a reading, not a gauge.** The counters recorded are what the
+  platform said at `looked_up_at`, and nothing revises them afterwards. Looking
+  the same URL up again appends a row rather than updating the old one, so the
+  history stays comparable against the timestamps beside it.
+- **A failed lookup is not recorded.** The row is written after a successful
+  fetch, so history is a list of answers rather than a list of attempts.
+- **Ownership is checked, not assumed.** Another account's lookup id returns
+  `404`, not `403`, so the endpoint does not confirm that someone else's lookup
+  exists.
+- **Counters absent ≠ zero.** A platform that does not report a counter, or an
+  uploader who hides one, leaves the field out. An Instagram photo post has no
+  view count, and `0` would say something different.
 
-## The poller
+## Channel contact email
 
-Tracked videos are refreshed in the background, and the history that
-accumulates is what makes this a dashboard rather than a bookmark list.
+A YouTube lookup makes a second API call, `channels.list`, for the uploader's
+channel. It brings back the channel title, its `@handle` URL and its
+description — and the contact email is read out of that description.
 
-**Postgres is the queue.** The claim uses `FOR UPDATE SKIP LOCKED`, so any
-number of replicas divide the work between them with no leader election and no
-chance of two fetching the same video. A worker that dies mid-fetch is covered
-by the claim expiring — there is no liveness tracking of workers anywhere.
+That is a deliberate choice of source, not an oversight:
 
-**Two pacing limits per platform, because they do different jobs.** Concurrency
-bounds what is in flight, which protects us; the minimum gap bounds how closely
-requests follow one another, which is what the platforms actually notice. A
-concurrency of 1 still hammers a fast endpoint.
+- **The Data API has no email field.** There is nothing to request. The address
+  a creator publishes lives in text they wrote.
+- **The About page is not scraped.** YouTube renders the "business enquiries"
+  address behind a bot check, so scraping it is unreliable and adversarial.
+  Owners who want to be contacted overwhelmingly also write the address into the
+  description, which the API returns cleanly.
+- **So the hit rate is partial, and honestly so.** Large channels using only the
+  About-page field come back with no email. `channel_email` absent means the
+  owner published nothing readable — never that the lookup failed. The full
+  `channel_description` is returned alongside so you can check for yourself.
 
-| Platform  | Concurrency | Min gap | Refresh | Why |
-|-----------|-------------|---------|---------|-----|
-| YouTube   | 4 | none | 6 h  | Metered API; the constraint is quota, not goodwill |
-| TikTok    | 2 | 2 s  | 12 h | Challenges ~⅓ of requests; fast retries earn a harder block |
-| Meta      | 2 | 2 s  | 12 h | Login walls for much of the catalogue; pushing changes nothing |
-
-**Failures are told apart, because the right response differs:**
-
-| Result | What happens |
-|--------|--------------|
-| `ErrNotFound` ×3 in a row | Retired: polling stops, every snapshot is kept, the dashboard greys it out. Three, not one — a single not-found can be a region block or a brief privacy toggle. |
-| `ErrBlocked` | Backs off. **Never** retires. A login wall is our problem, not evidence the video is gone; conflating them would quietly delete people's videos during a bad afternoon. |
-| `ErrRateLimited` | Backs off the **whole platform** for an hour. The limit belongs to the platform, not to the video that happened to hit it. |
-| `ErrMisconfigured` | Disables that platform for the life of the process, logged once. A missing API key will not fix itself, and retrying it hundreds of times an hour fills the logs and the audit table with the same answer. |
-
-Backoff is exponential to a 24 h cap with **±20% jitter**. Without jitter,
-everything that failed during an outage retries in the same second when the
-outage ends — the fleet synchronises itself into the thundering herd the
-backoff was meant to avoid.
-
-`GET /healthz` reports each platform's polling state, including a disabled or
-backed-off one. It stays in liveness rather than readiness on purpose: a replica
-whose poller has given up on a platform can still serve requests perfectly well,
-so it must not be pulled out of the load balancer — but somebody does need to be
-able to see that videos are quietly not being refreshed.
-
-Set `POLL_ENABLED=false` to run web replicas that serve traffic and one worker
-replica that polls.
+Extraction is in `internal/provider/youtube/channel.go`. It reads plain
+addresses first and only then the dodge-the-scraper forms (`name (at) example
+(dot) com`), because the second pattern is looser and more willing to be wrong.
+Both patterns require real separators around `at` and `dot`: without that,
+"recommendations.TED" parses as `recommend@ions.TED`, which is exactly the bug
+the live tests caught.
 
 ## The dashboard
 
@@ -274,10 +244,9 @@ internal/web/
   web.go         server, template parsing, embedded assets
   routes.go      route table and content negotiation
   handlers.go    one handler per page
-  present.go     input whitelists and human-readable error copy
+  present.go     human-readable error copy
   view.go        view models the templates receive
-  chart.go       SVG sparklines and history charts, generated in Go
-  format.go      counts, deltas, relative times
+  format.go      counts and relative times
   templates/     layout, pages, partials — parsed once at boot
   static/        app.css, app.js
 ```
@@ -286,13 +255,6 @@ internal/web/
 notices, rather than on the one page nobody opened before release; the pages
 are rendered into a buffer first, so a template error cannot leave a half-page
 already sent with a `200`.
-
-**Charts are inline SVG generated in Go.** A sparkline is a polyline; the detail
-chart adds a labelled scale and marks each individual reading, so a chart drawn
-from four points does not pretend to the smoothness of one drawn from four
-hundred. Readings the platform did not report are *skipped*, never plotted as
-zero — a gap drawn as a fall to zero and back would look like the video lost
-every view it had.
 
 **One middleware protects both surfaces; only the presentation differs.** A
 browser navigating to a page it needs an account for is redirected to sign in,
@@ -304,15 +266,12 @@ fallback — a redirect to an HTML login form is useless to an API client.
 button behaves. The message that survives the redirect rides in a short-lived
 cookie, cleared as it is read.
 
-**JavaScript is progressive enhancement only.** The filters are a GET form with
-a submit button that is hidden when scripting is available; the script adds
-auto-submit on change and a confirmation on "stop tracking". Every view has a
-shareable URL, and nothing on the page depends on the file loading.
+**JavaScript is progressive enhancement only.** Every view has a shareable URL,
+the lookup form is a plain POST, and nothing on the page depends on the script
+loading.
 
 Both light and dark themes are derived from one set of custom properties, so a
-component never picks a colour that works in only one of them. Status carries a
-coloured stripe as well as a hue, so "needs attention" reads without relying on
-colour vision.
+component never picks a colour that works in only one of them.
 
 ## Swagger / OpenAPI
 
@@ -466,19 +425,18 @@ on the retry.
 cmd/api/                  process entry point: config → wiring → serve
 internal/
   config/                 env-driven config with defaults + validation
-  domain/                 VideoStats, Provider interface, sentinel errors
+  domain/                 VideoStats, Lookup, Provider interface, sentinels
   stats/                  application layer: provider lookup + TTL cache
   api/                    HTTP transport: handlers, router, error mapping
   docs/                   embedded OpenAPI 3.1 spec + Swagger UI handlers
   httpx/                  server lifecycle, middleware, JSON envelopes
   auth/                   argon2id, sessions, CSRF, login rate limiting
-  tracking/               per-user video lists, growth, refresh policy
-  poller/                 claim loop, per-platform pacing, backoff
+  lookup/                 fetch a URL's stats and record it against an account
   web/                    server-rendered dashboard
     templates/            html/template pages and partials, embedded
     static/               one stylesheet, one script, embedded
   storage/postgres/       pool, migrations, repositories (users, sessions,
-                          videos, tracking, metrics, rate limits)
+                          lookups, rate limits)
   provider/               registry that resolves a URL to its provider
     youtube/              YouTube Data API v3 + URL parsing
     meta/                 instagram embed + facebook page/graph extraction
@@ -542,15 +500,11 @@ make lint     # fmt + vet + test
 make build    # ./bin/socialstats
 make docker
 
-make db-up    # start postgres (dev :5432, disposable test db :5433)
+make db-up    # start postgres (dev :5434, disposable test db :5433)
 make migrate  # apply pending migrations
 make db-reset # destroy the dev database and rebuild from migrations
 make db-shell # psql against the dev database
 ```
-
-The schema, accounts, the tracking API, the background poller and the dashboard
-are in place. Retention and rollups, and YouTube's batched fetch, follow; see
-`docs/dashboard-design.md` for the plan and the reasoning.
 
 Both targets run with the race detector, which needs cgo and a C compiler. On a
 machine without one, `make test RACE=` and `make test-db RACE=` run the same
@@ -567,30 +521,24 @@ stays fast and dependency-free.
 Named honestly, because a list of what is missing is more useful than a list of
 what is done.
 
-**Next, and load bearing before this is busy:**
-
-- **Retention and rollups** (step 6 in the design). Raw snapshots are meant to
-  age out after 30 days into `metric_daily`, and monthly partitions are meant to
-  be dropped rather than deleted. The schema and the SQL for both exist and are
-  tested; nothing runs them on a schedule, so storage grows without bound and
-  charts longer than the raw window fall back to the raw series.
-- **YouTube batching** (step 7). `videos.list` takes 50 ids per quota unit, so
-  batching is the difference between 10,000 and 500,000 refreshes a day. The
-  poller fetches one at a time.
-
 **Deliberate omissions, with the reasoning:**
 
 - **Per-caller rate limiting on the API.** Only the sign-in path is limited
-  today. The tracking endpoints are bounded by the per-account video cap, which
-  is what actually protects upstream budgets; a request limit protects the
-  database, and that is not the scarce resource yet.
-- **Metrics and tracing.** The audit trail answers "is TikTok degrading?" and
-  the logs are structured, which covers the questions that have come up. A
-  Prometheus endpoint is a small change when somebody has a dashboard to put it
-  on.
+  today. A lookup costs an upstream call, so an account looping on `POST
+  /v1/lookups` can spend the shared YouTube quota or earn a TikTok block. The
+  TTL cache absorbs a repeated URL, but not a list of different ones — this is
+  the first thing to add if the service is opened up beyond a trusted group.
+- **Metrics and tracing.** The logs are structured, which covers the questions
+  that have come up so far. A Prometheus endpoint is a small change when
+  somebody has a dashboard to put it on.
 - **Email.** No verification, no password reset, no notifications. This is why
   registration discloses that an address already has an account — the
   alternative needs somewhere to send a message to.
-- **Cursor pagination.** The video list is limit/offset. At a few hundred rows
-  per account that is honest; a cursor matters when the list is long enough to
-  shift under the reader, and it is not.
+- **Pagination.** The history returns the most recent `LOOKUP_HISTORY_LIMIT`
+  (100) and stops. Older lookups are in the table and readable by id, but
+  nothing pages back through them.
+
+- **Scheduled re-checks.** Deliberately removed. If you want to watch a number
+  move over time rather than read it once, that is a different product, and the
+  polling machinery it needs — a claim queue, per-platform pacing, backoff,
+  retirement rules — is what this service used to be.

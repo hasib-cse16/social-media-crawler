@@ -110,6 +110,11 @@ func (p *Provider) Stats(ctx context.Context, rawURL string) (*domain.VideoStats
 	if t, err := time.Parse(time.RFC3339, item.Snippet.PublishedAt); err == nil {
 		stats.PublishedAt = &t
 	}
+
+	// A second call, for the channel's about-text and the contact address in
+	// it. Best-effort: see (*Provider).channel.
+	p.channel(ctx, stats)
+
 	return stats, nil
 }
 

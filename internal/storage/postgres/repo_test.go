@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -39,39 +38,21 @@ func makeUser(t *testing.T, db *DB, ctx context.Context, email string) *domain.U
 	return u
 }
 
-func makeVideo(t *testing.T, db *DB, ctx context.Context, platform domain.Platform, id string) *domain.Video {
-	t.Helper()
-	v, err := db.Videos().Upsert(ctx, domain.NewVideo{
-		Platform:        platform,
-		PlatformVideoID: id,
-		CanonicalURL:    "https://example.test/" + id,
-	})
-	if err != nil {
-		t.Fatalf("upsert video %s: %v", id, err)
-	}
-	return v
-}
-
-// okOutcome builds a successful fetch result for a video.
-func okOutcome(at time.Time, views uint64) domain.FetchOutcome {
-	next := at.Add(6 * time.Hour)
-	return domain.FetchOutcome{
-		Stats: &domain.VideoStats{
-			Platform:     domain.PlatformYouTube,
-			VideoID:      "abc",
-			CanonicalURL: "https://youtu.be/abc",
-			Title:        "A video",
-			ChannelID:    "UC123",
-			ChannelTitle: "A channel",
-			ViewCount:    domain.U64(views),
-			LikeCount:    domain.U64(views / 10),
-			FetchedAt:    at,
-		},
-		Status:        domain.FetchOK,
-		AttemptStatus: domain.AttemptOK,
-		StartedAt:     at,
-		Duration:      120 * time.Millisecond,
-		NextFetchAt:   &next,
+// makeStats builds a provider result to record.
+func makeStats(platform domain.Platform, id string, views uint64) *domain.VideoStats {
+	return &domain.VideoStats{
+		Platform:           platform,
+		VideoID:            id,
+		CanonicalURL:       "https://example.test/" + id,
+		Title:              "A video",
+		ChannelID:          "UC123",
+		ChannelTitle:       "A channel",
+		ChannelURL:         "https://www.youtube.com/@achannel",
+		ChannelEmail:       "hello@achannel.test",
+		ChannelDescription: "Business: hello@achannel.test",
+		ViewCount:          domain.U64(views),
+		LikeCount:          domain.U64(views / 10),
+		FetchedAt:          time.Now().UTC().Truncate(time.Millisecond),
 	}
 }
 
@@ -408,384 +389,142 @@ func TestDeletingAUserCascadesToSessions(t *testing.T) {
 
 // The natural key is the deduplication point: two users pasting different URL
 // forms of one video must land on one row, or they get two histories of it.
-func TestVideoUpsertDeduplicatesOnTheNaturalKey(t *testing.T) {
+
+// ---------- lookups ----------
+
+func TestLookupRoundTripsEveryField(t *testing.T) {
 	db, ctx := migrated(t)
+	u := makeUser(t, db, ctx, "erin@example.com")
 
-	first, err := db.Videos().Upsert(ctx, domain.NewVideo{
-		Platform: domain.PlatformYouTube, PlatformVideoID: "dQw4w9WgXcQ",
-		CanonicalURL: "https://youtu.be/dQw4w9WgXcQ",
-	})
+	in := domain.NewLookup(u.ID, makeStats(domain.PlatformYouTube, "abc123", 4200))
+	created, err := db.Lookups().Create(ctx, in)
 	if err != nil {
-		t.Fatalf("first upsert: %v", err)
+		t.Fatalf("Create: %v", err)
+	}
+	if created.ID == 0 || created.PublicID == "" {
+		t.Fatalf("created lookup has no ids: %+v", created)
 	}
 
-	second, err := db.Videos().Upsert(ctx, domain.NewVideo{
-		Platform: domain.PlatformYouTube, PlatformVideoID: "dQw4w9WgXcQ",
-		CanonicalURL: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-	})
+	got, err := db.Lookups().ByPublicID(ctx, u.ID, created.PublicID)
 	if err != nil {
-		t.Fatalf("second upsert: %v", err)
+		t.Fatalf("ByPublicID: %v", err)
 	}
-
-	if first.ID != second.ID {
-		t.Errorf("upsert created two rows (%d and %d) for one video", first.ID, second.ID)
+	if got.ChannelEmail != "hello@achannel.test" {
+		t.Errorf("channel email = %q, want it persisted", got.ChannelEmail)
 	}
-	if second.CanonicalURL != "https://www.youtube.com/watch?v=dQw4w9WgXcQ" {
-		t.Errorf("canonical url = %q, want the newer form", second.CanonicalURL)
+	if got.ViewCount == nil || *got.ViewCount != 4200 {
+		t.Errorf("view count = %v, want 4200", got.ViewCount)
 	}
-
-	// The same id on a different platform is a different video.
-	other, err := db.Videos().Upsert(ctx, domain.NewVideo{
-		Platform: domain.PlatformTikTok, PlatformVideoID: "dQw4w9WgXcQ",
-		CanonicalURL: "https://tiktok.test/x",
-	})
-	if err != nil {
-		t.Fatalf("cross-platform upsert: %v", err)
-	}
-	if other.ID == first.ID {
-		t.Error("the same id on two platforms collapsed into one row")
+	// A counter the platform did not report must stay absent rather than
+	// becoming zero, which is a different fact.
+	if got.ShareCount != nil {
+		t.Errorf("share count = %v, want nil for a platform that does not report it", *got.ShareCount)
 	}
 }
 
-func TestVideoDefaultsAndLookups(t *testing.T) {
+func TestLookupsAreScopedToTheirUser(t *testing.T) {
 	db, ctx := migrated(t)
-	v := makeVideo(t, db, ctx, domain.PlatformTikTok, "7249376077976472833")
+	mine := makeUser(t, db, ctx, "mine@example.com")
+	theirs := makeUser(t, db, ctx, "theirs@example.com")
 
-	if v.Schedule.LastFetchStatus != domain.FetchPending {
-		t.Errorf("status = %q, want pending", v.Schedule.LastFetchStatus)
-	}
-	if v.Schedule.Interval != 6*time.Hour {
-		t.Errorf("interval = %v, want the 6h default", v.Schedule.Interval)
-	}
-	if v.Schedule.NextFetchAt != nil {
-		t.Error("an untracked video should not be scheduled")
-	}
-	if v.Latest.ViewCount != nil {
-		t.Error("a never-fetched video should have no view count, not zero")
+	created, err := db.Lookups().Create(ctx, domain.NewLookup(mine.ID, makeStats(domain.PlatformTikTok, "vid1", 10)))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
 	}
 
-	byPublic, err := db.Videos().ByPublicID(ctx, v.PublicID)
-	if err != nil || byPublic.ID != v.ID {
-		t.Fatalf("ByPublicID = %v, %v", byPublic, err)
+	// Another user's public id must be indistinguishable from one that does not
+	// exist, or the endpoint becomes a way to probe for other people's rows.
+	if _, err := db.Lookups().ByPublicID(ctx, theirs.ID, created.PublicID); !errors.Is(err, domain.ErrRecordNotFound) {
+		t.Errorf("cross-user read = %v, want ErrRecordNotFound", err)
 	}
-	byNatural, err := db.Videos().ByPlatformID(ctx, domain.PlatformTikTok, "7249376077976472833")
-	if err != nil || byNatural.ID != v.ID {
-		t.Fatalf("ByPlatformID = %v, %v", byNatural, err)
+	if err := db.Lookups().Delete(ctx, theirs.ID, created.PublicID); !errors.Is(err, domain.ErrRecordNotFound) {
+		t.Errorf("cross-user delete = %v, want ErrRecordNotFound", err)
+	}
+
+	if _, err := db.Lookups().ByPublicID(ctx, mine.ID, created.PublicID); err != nil {
+		t.Errorf("owner read after a failed cross-user delete: %v", err)
 	}
 }
 
-func TestVideoRejectsAnUnknownPlatform(t *testing.T) {
+func TestLookingUpTheSameURLAppendsRatherThanReplaces(t *testing.T) {
 	db, ctx := migrated(t)
+	u := makeUser(t, db, ctx, "frank@example.com")
 
-	_, err := db.Videos().Upsert(ctx, domain.NewVideo{
-		Platform: "myspace", PlatformVideoID: "1", CanonicalURL: "https://x.test",
-	})
-	if !errors.Is(err, domain.ErrStorage) {
-		t.Errorf("error = %v, want ErrStorage from the platform check constraint", err)
+	first := makeStats(domain.PlatformYouTube, "same", 100)
+	if _, err := db.Lookups().Create(ctx, domain.NewLookup(u.ID, first)); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	second := makeStats(domain.PlatformYouTube, "same", 250)
+	second.FetchedAt = first.FetchedAt.Add(time.Hour)
+	if _, err := db.Lookups().Create(ctx, domain.NewLookup(u.ID, second)); err != nil {
+		t.Fatalf("second Create: %v", err)
+	}
+
+	recent, err := db.Lookups().Recent(ctx, u.ID, 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(recent) != 2 {
+		t.Fatalf("got %d rows, want 2 — a re-check is history, not an update", len(recent))
+	}
+	// Newest first, so the dashboard's top row is the latest answer.
+	if *recent[0].ViewCount != 250 {
+		t.Errorf("first row has %d views, want the newest reading (250)", *recent[0].ViewCount)
 	}
 }
 
-// ---------- recording a fetch ----------
-
-func TestRecordWritesSnapshotLatestAndAuditTogether(t *testing.T) {
+func TestRecentHonoursItsLimit(t *testing.T) {
 	db, ctx := migrated(t)
-	v := makeVideo(t, db, ctx, domain.PlatformYouTube, "abc")
+	u := makeUser(t, db, ctx, "grace@example.com")
 
-	at := time.Now().UTC().Truncate(time.Millisecond)
-	if err := db.Videos().Record(ctx, v.ID, okOutcome(at, 220500)); err != nil {
-		t.Fatalf("Record: %v", err)
+	base := time.Now().UTC()
+	for i := range 5 {
+		s := makeStats(domain.PlatformMeta, fmt.Sprintf("v%d", i), uint64(i))
+		s.FetchedAt = base.Add(time.Duration(i) * time.Minute)
+		if _, err := db.Lookups().Create(ctx, domain.NewLookup(u.ID, s)); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
 	}
 
-	got, err := db.Videos().ByID(ctx, v.ID)
+	recent, err := db.Lookups().Recent(ctx, u.ID, 3)
 	if err != nil {
-		t.Fatalf("ByID: %v", err)
+		t.Fatalf("Recent: %v", err)
 	}
-	if got.Latest.ViewCount == nil || *got.Latest.ViewCount != 220500 {
-		t.Errorf("latest view count = %v, want 220500", got.Latest.ViewCount)
+	if len(recent) != 3 {
+		t.Fatalf("got %d rows, want 3", len(recent))
 	}
-	if got.Title != "A video" || got.ChannelTitle != "A channel" {
-		t.Errorf("metadata not applied: %+v", got)
-	}
-	if got.Schedule.LastFetchStatus != domain.FetchOK {
-		t.Errorf("status = %q, want ok", got.Schedule.LastFetchStatus)
-	}
-	if got.Schedule.LockedUntil != nil {
-		t.Error("Record should release the claim it recorded against")
-	}
-
-	history, err := db.Metrics().History(ctx, v.ID, at.Add(-time.Hour), at.Add(time.Hour), BucketRaw)
-	if err != nil {
-		t.Fatalf("History: %v", err)
-	}
-	if len(history) != 1 || history[0].ViewCount == nil || *history[0].ViewCount != 220500 {
-		t.Fatalf("history = %+v, want one snapshot of 220500", history)
-	}
-
-	attempts, err := db.Metrics().Attempts(ctx, v.ID, 10)
-	if err != nil {
-		t.Fatalf("Attempts: %v", err)
-	}
-	if len(attempts) != 1 || attempts[0].Status != domain.AttemptOK {
-		t.Fatalf("attempts = %+v, want one ok", attempts)
-	}
-	if attempts[0].Platform != domain.PlatformYouTube {
-		t.Errorf("attempt platform = %q, want it taken from the video", attempts[0].Platform)
+	if recent[0].VideoID != "v4" {
+		t.Errorf("newest row = %q, want v4", recent[0].VideoID)
 	}
 }
 
-// A failed fetch still records the attempt and the new schedule. "We tried at
-// 14:00 and Meta served a login wall" is exactly what the audit trail is for.
-func TestRecordOnFailureKeepsTheLastGoodReading(t *testing.T) {
+func TestDeletingAUserCascadesToLookups(t *testing.T) {
 	db, ctx := migrated(t)
-	v := makeVideo(t, db, ctx, domain.PlatformMeta, "999")
+	u := makeUser(t, db, ctx, "heidi@example.com")
 
-	at := time.Now().UTC()
-	if err := db.Videos().Record(ctx, v.ID, okOutcome(at.Add(-time.Hour), 1000)); err != nil {
-		t.Fatalf("seed Record: %v", err)
+	if _, err := db.Lookups().Create(ctx, domain.NewLookup(u.ID, makeStats(domain.PlatformYouTube, "x", 1))); err != nil {
+		t.Fatalf("Create: %v", err)
 	}
-
-	next := at.Add(2 * time.Hour)
-	err := db.Videos().Record(ctx, v.ID, domain.FetchOutcome{
-		Status:              domain.FetchBlocked,
-		AttemptStatus:       domain.AttemptBlocked,
-		ErrorCode:           "upstream_blocked",
-		ErrorDetail:         "facebook served a login wall",
-		StartedAt:           at,
-		Duration:            3 * time.Second,
-		ConsecutiveFailures: 1,
-		NextFetchAt:         &next,
-	})
-	if err != nil {
-		t.Fatalf("Record failure: %v", err)
+	if err := db.Users().Delete(ctx, u.ID); err != nil {
+		t.Fatalf("Delete user: %v", err)
 	}
 
-	got, _ := db.Videos().ByID(ctx, v.ID)
-	if got.Latest.ViewCount == nil || *got.Latest.ViewCount != 1000 {
-		t.Errorf("latest = %v; a failed fetch must not erase the last good reading", got.Latest.ViewCount)
+	var count int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM lookups WHERE user_id = $1`, u.ID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
 	}
-	if got.Schedule.LastFetchStatus != domain.FetchBlocked || got.Schedule.ConsecutiveFailures != 1 {
-		t.Errorf("schedule = %+v", got.Schedule)
-	}
-	if !strings.Contains(got.Schedule.LastFetchError, "login wall") {
-		t.Errorf("last error = %q", got.Schedule.LastFetchError)
-	}
-
-	// Only the successful fetch produced a snapshot.
-	history, _ := db.Metrics().History(ctx, v.ID, at.Add(-24*time.Hour), at.Add(time.Hour), BucketRaw)
-	if len(history) != 1 {
-		t.Errorf("%d snapshots, want 1: a failed fetch must not write one", len(history))
-	}
-
-	// Both attempts were logged.
-	attempts, _ := db.Metrics().Attempts(ctx, v.ID, 10)
-	if len(attempts) != 2 {
-		t.Errorf("%d attempts logged, want 2", len(attempts))
-	}
-	if attempts[0].Status != domain.AttemptBlocked || attempts[0].ErrorCode != "upstream_blocked" {
-		t.Errorf("newest attempt = %+v", attempts[0])
+	if count != 0 {
+		t.Errorf("%d lookups survived the account being deleted", count)
 	}
 }
 
-// A blocked video must never be retired: a login wall is our problem, not
-// evidence the video is gone. Only an explicit UnavailableSince retires one.
-func TestRetiringAVideoStopsPollingButKeepsHistory(t *testing.T) {
+func TestLookupRejectsAnUnknownPlatform(t *testing.T) {
 	db, ctx := migrated(t)
 	u := makeUser(t, db, ctx, "ivan@example.com")
-	v := makeVideo(t, db, ctx, domain.PlatformYouTube, "gone")
 
-	if _, err := db.Tracking().Track(ctx, u.ID, v.ID, ""); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
-	at := time.Now().UTC()
-	if err := db.Videos().Record(ctx, v.ID, okOutcome(at.Add(-time.Hour), 500)); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	retired := at
-	err := db.Videos().Record(ctx, v.ID, domain.FetchOutcome{
-		Status: domain.FetchNotFound, AttemptStatus: domain.AttemptNotFound,
-		ErrorCode: "not_found", StartedAt: at, ConsecutiveFailures: 3,
-		NextFetchAt: nil, UnavailableSince: &retired,
-	})
-	if err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-
-	got, _ := db.Videos().ByID(ctx, v.ID)
-	if !got.Schedule.Retired() {
-		t.Error("video was not retired")
-	}
-	if got.Schedule.NextFetchAt != nil {
-		t.Error("a retired video is still scheduled")
-	}
-	if got.Latest.ViewCount == nil || *got.Latest.ViewCount != 500 {
-		t.Error("retiring a video discarded its last known figures")
-	}
-
-	claimed, err := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 10, time.Minute)
-	if err != nil {
-		t.Fatalf("ClaimDue: %v", err)
-	}
-	if len(claimed) != 0 {
-		t.Errorf("claimed %d retired videos, want 0", len(claimed))
-	}
-}
-
-// ---------- claiming ----------
-
-func TestClaimDueRespectsScheduleAndLocks(t *testing.T) {
-	db, ctx := migrated(t)
-	u := makeUser(t, db, ctx, "judy@example.com")
-
-	due := makeVideo(t, db, ctx, domain.PlatformYouTube, "due")
-	notYet := makeVideo(t, db, ctx, domain.PlatformYouTube, "later")
-	untracked := makeVideo(t, db, ctx, domain.PlatformYouTube, "untracked")
-	otherPlatform := makeVideo(t, db, ctx, domain.PlatformTikTok, "tiktok")
-
-	for _, v := range []*domain.Video{due, notYet, otherPlatform} {
-		if _, err := db.Tracking().Track(ctx, u.ID, v.ID, ""); err != nil {
-			t.Fatalf("Track: %v", err)
-		}
-	}
-	_ = untracked
-
-	if _, err := db.Pool.Exec(ctx,
-		`UPDATE videos SET next_fetch_at = now() + interval '1 hour' WHERE id = $1`, notYet.ID); err != nil {
-		t.Fatalf("schedule: %v", err)
-	}
-
-	claimed, err := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 10, 5*time.Minute)
-	if err != nil {
-		t.Fatalf("ClaimDue: %v", err)
-	}
-	if len(claimed) != 1 || claimed[0].ID != due.ID {
-		t.Fatalf("claimed %d videos (%v), want just the due one", len(claimed), claimed)
-	}
-	if claimed[0].Schedule.LockedUntil == nil {
-		t.Error("claimed video is not locked")
-	}
-
-	// A locked video is not handed out twice.
-	again, err := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 10, 5*time.Minute)
-	if err != nil {
-		t.Fatalf("second ClaimDue: %v", err)
-	}
-	if len(again) != 0 {
-		t.Errorf("claimed %d already-locked videos, want 0", len(again))
-	}
-
-	// Releasing puts it back without changing when it is next due.
-	if err := db.Videos().Release(ctx, due.ID); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	third, _ := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 10, 5*time.Minute)
-	if len(third) != 1 {
-		t.Errorf("released video was not reclaimable")
-	}
-}
-
-// An expired lock is what makes a worker dying mid-fetch recoverable, with no
-// liveness tracking of workers anywhere.
-func TestClaimDueReclaimsAfterALockExpires(t *testing.T) {
-	db, ctx := migrated(t)
-	u := makeUser(t, db, ctx, "ken@example.com")
-	v := makeVideo(t, db, ctx, domain.PlatformYouTube, "orphan")
-	if _, err := db.Tracking().Track(ctx, u.ID, v.ID, ""); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
-
-	if _, err := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 1, time.Hour); err != nil {
-		t.Fatalf("ClaimDue: %v", err)
-	}
-	// The worker dies: simulate its lock ageing out.
-	if _, err := db.Pool.Exec(ctx,
-		`UPDATE videos SET locked_until = now() - interval '1 minute' WHERE id = $1`, v.ID); err != nil {
-		t.Fatalf("expire lock: %v", err)
-	}
-
-	reclaimed, err := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 1, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimDue: %v", err)
-	}
-	if len(reclaimed) != 1 {
-		t.Error("an abandoned video was never reclaimed")
-	}
-}
-
-// SKIP LOCKED is the whole scaling story: several workers must divide the work
-// with no coordination and no video fetched twice.
-func TestConcurrentWorkersDivideTheWork(t *testing.T) {
-	db, ctx := migrated(t)
-	u := makeUser(t, db, ctx, "workers@example.com")
-
-	const videos = 30
-	for i := range videos {
-		v := makeVideo(t, db, ctx, domain.PlatformYouTube, fmt.Sprintf("v%02d", i))
-		if _, err := db.Tracking().Track(ctx, u.ID, v.ID, ""); err != nil {
-			t.Fatalf("Track: %v", err)
-		}
-	}
-
-	const workers = 6
-	results := make(chan []*domain.Video, workers)
-	for range workers {
-		go func() {
-			claimed, err := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 10, time.Minute)
-			if err != nil {
-				t.Errorf("ClaimDue: %v", err)
-			}
-			results <- claimed
-		}()
-	}
-
-	seen := map[int64]int{}
-	total := 0
-	for range workers {
-		for _, v := range <-results {
-			seen[v.ID]++
-			total++
-		}
-	}
-
-	if total != videos {
-		t.Errorf("claimed %d videos in total, want %d", total, videos)
-	}
-	for id, n := range seen {
-		if n > 1 {
-			t.Errorf("video %d was claimed by %d workers", id, n)
-		}
-	}
-}
-
-func TestBackoffPlatformMovesTheWholePlatform(t *testing.T) {
-	db, ctx := migrated(t)
-	u := makeUser(t, db, ctx, "limit@example.com")
-
-	for i := range 3 {
-		v := makeVideo(t, db, ctx, domain.PlatformTikTok, fmt.Sprintf("tt%d", i))
-		if _, err := db.Tracking().Track(ctx, u.ID, v.ID, ""); err != nil {
-			t.Fatalf("Track: %v", err)
-		}
-	}
-	yt := makeVideo(t, db, ctx, domain.PlatformYouTube, "yt")
-	if _, err := db.Tracking().Track(ctx, u.ID, yt.ID, ""); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
-
-	// A rate limit belongs to the platform, not the video that happened to hit
-	// it: backing off one id sends the next tick into the same limit.
-	n, err := db.Videos().BackoffPlatform(ctx, domain.PlatformTikTok, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("BackoffPlatform: %v", err)
-	}
-	if n != 3 {
-		t.Errorf("backed off %d videos, want 3", n)
-	}
-
-	if claimed, _ := db.Videos().ClaimDue(ctx, domain.PlatformTikTok, 10, time.Minute); len(claimed) != 0 {
-		t.Errorf("claimed %d tiktok videos after backing the platform off", len(claimed))
-	}
-	if claimed, _ := db.Videos().ClaimDue(ctx, domain.PlatformYouTube, 10, time.Minute); len(claimed) != 1 {
-		t.Error("backing off tiktok also stopped youtube")
+	in := domain.NewLookup(u.ID, makeStats("myspace", "x", 1))
+	if _, err := db.Lookups().Create(ctx, in); err == nil {
+		t.Error("an unknown platform was accepted; the CHECK constraint is not doing its job")
 	}
 }

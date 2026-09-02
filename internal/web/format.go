@@ -11,7 +11,6 @@
 package web
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -84,39 +83,6 @@ func comma(n int64) string {
 	return b.String()
 }
 
-// signed renders a delta with an explicit sign.
-//
-// Negatives are real: platforms revise view counts downward, so a minus here is
-// a measurement rather than a bug, and the display has to be able to say so.
-func signed(n *int64) string {
-	if n == nil {
-		return "—"
-	}
-	switch {
-	case *n > 0:
-		return "+" + comma(*n)
-	case *n < 0:
-		return comma(*n) // comma already carries the minus
-	default:
-		return "0"
-	}
-}
-
-// deltaClass names the CSS class for a delta, so colour is applied from one
-// place rather than in three templates.
-func deltaClass(n *int64) string {
-	switch {
-	case n == nil:
-		return "delta-none"
-	case *n > 0:
-		return "delta-up"
-	case *n < 0:
-		return "delta-down"
-	default:
-		return "delta-flat"
-	}
-}
-
 // ago renders a timestamp as a rough age.
 //
 // Rough on purpose: "3 hours ago" is what somebody scanning a list actually
@@ -158,22 +124,6 @@ func timestamp(t *time.Time) string {
 	return t.UTC().Format("2 Jan 2006 15:04 MST")
 }
 
-// duration renders a configured interval readably.
-func duration(d time.Duration) string {
-	switch {
-	case d <= 0:
-		return "—"
-	case d < time.Minute:
-		return plural(int(d.Seconds()), "second")
-	case d < time.Hour:
-		return plural(int(d.Minutes()), "minute")
-	case d%(24*time.Hour) == 0 && d >= 24*time.Hour:
-		return plural(int(d.Hours()/24), "day")
-	default:
-		return plural(int(d.Hours()), "hour")
-	}
-}
-
 // platformName is the display name for a platform.
 func platformName(p domain.Platform) string {
 	switch p {
@@ -188,47 +138,6 @@ func platformName(p domain.Platform) string {
 	}
 }
 
-// statusLabel turns a fetch status into something a person can act on.
-//
-// The wording matters here: "blocked" and "gone" look similar in a table but
-// mean opposite things — one is our problem and will likely clear, the other is
-// the video actually being deleted — and a dashboard that blurs them teaches
-// people to ignore both.
-func statusLabel(v *domain.Video) string {
-	if v.Schedule.UnavailableSince != nil {
-		return "Removed by the platform"
-	}
-	switch v.Schedule.LastFetchStatus {
-	case domain.FetchOK:
-		return "OK"
-	case domain.FetchPending:
-		return "Not fetched yet"
-	case domain.FetchBlocked:
-		return "Blocked — will retry"
-	case domain.FetchNotFound:
-		return "Not found — will retry"
-	case domain.FetchError:
-		return "Failed — will retry"
-	default:
-		return string(v.Schedule.LastFetchStatus)
-	}
-}
-
-// statusTone names the visual severity, kept separate from the accent colour so
-// "needs attention" reads at a glance without depending on hue alone.
-func statusTone(v *domain.Video) string {
-	switch {
-	case v.Schedule.UnavailableSince != nil:
-		return "critical"
-	case v.Schedule.LastFetchStatus == domain.FetchOK:
-		return "ok"
-	case v.Schedule.LastFetchStatus == domain.FetchPending:
-		return "neutral"
-	default:
-		return "warning"
-	}
-}
-
 // trimZero drops a trailing ".0" so 1.0M reads as 1M.
 func trimZero(f float64) string {
 	s := strconv.FormatFloat(round1(f), 'f', 1, 64)
@@ -237,19 +146,16 @@ func trimZero(f float64) string {
 
 func round1(f float64) float64 { return math.Round(f*10) / 10 }
 
-// title falls back through the names a video might have, so a row is never
-// blank while a fetch is pending.
-func videoTitle(v *domain.Video, label string) string {
-	if label != "" {
-		return label
+// lookupTitle falls back through the names a video might have, so a row is
+// never blank when a platform reports no title.
+func lookupTitle(l domain.Lookup) string {
+	if l.Title != "" {
+		return truncate(l.Title, 120)
 	}
-	if v.Title != "" {
-		return v.Title
+	if l.ChannelTitle != "" {
+		return l.ChannelTitle + " — " + l.VideoID
 	}
-	if v.ChannelTitle != "" {
-		return v.ChannelTitle + " — " + v.PlatformVideoID
-	}
-	return v.PlatformVideoID
+	return l.VideoID
 }
 
 // truncate shortens a caption for a single-line cell. TikTok and Instagram
@@ -264,6 +170,3 @@ func truncate(s string, n int) string {
 
 // pluralise is exposed for counts in copy.
 func pluralise(n int, unit string) string { return plural(n, unit) }
-
-// percent renders a ratio as a whole-number percentage.
-func percent(f float64) string { return fmt.Sprintf("%.0f%%", f*100) }

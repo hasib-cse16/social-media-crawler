@@ -1,6 +1,21 @@
 # Dashboard design: per-user video tracking on PostgreSQL
 
-**Status:** approved; steps 1–5 and 8 implemented
+> **Superseded — kept for the reasoning, not as a description of the code.**
+>
+> The tracking and polling this document designs were built, then deliberately
+> removed: the product it serves is "watch a number move over time", and what
+> was actually wanted was "paste a link, get the number now". What survives from
+> it is accounts, sessions, CSRF and login rate limiting (steps 1–2), which the
+> service still uses unchanged.
+>
+> The parts describing tracked lists, snapshots, daily rollups, the claim queue,
+> per-platform pacing, backoff and retirement no longer correspond to anything
+> in the repository. Read `README.md` for what the service does now. This file
+> is worth keeping because the failure-mode analysis — why a block must never be
+> treated as a deletion, why backoff needs jitter — is the expensive part, and it
+> would apply again to anything that reintroduces scheduled fetching.
+
+**Status:** superseded; see the note above
 **Scope:** turn the stateless stats API into a multi-user dashboard that tracks
 view counts for YouTube, TikTok and Meta videos over time.
 
